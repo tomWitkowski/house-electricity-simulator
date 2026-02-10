@@ -229,7 +229,7 @@ with st.sidebar:
             with col1:
                 hours = st.number_input(
                     f"{app.name} - godziny/dzień",
-                    0.0, 24.0, app.daily_hours, 0.1,
+                    0.0, 24.0, float(app.daily_hours), 0.1,
                     key=f"app_h_{app.name}",
                 )
             with col2:
