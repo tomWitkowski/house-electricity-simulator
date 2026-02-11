@@ -1,703 +1,629 @@
-"""House Electricity Simulator - Streamlit Application.
+"""House Electricity Simulator - Streamlit Application."""
 
-Monte Carlo simulation of home energy costs with PV, battery, heat pump, etc.
-"""
-
+import math
+import json
 import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
+import folium
+from streamlit_folium import st_folium
 
 from simulator.models import (
     Location, HouseParams, PVParams, BatteryParams, HeatPumpParams,
     RecuperatorParams, ACParams, FloorHeatingParams, Appliance,
     AppliancesParams, TariffParams, SimulationParams,
+    default_appliances, params_to_dict, params_from_dict,
 )
 from simulator.engine import run_monte_carlo
+from simulator.weather import generate_year_weather
+from simulator.i18n import t, APPLIANCE_KEY_MAP
 
-st.set_page_config(
-    page_title="Symulator Energii Domu",
-    page_icon="🏠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Home Energy Simulator", page_icon="\U0001F3E0",
+                   layout="wide", initial_sidebar_state="expanded")
 
-# ── Custom CSS ──────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .block-container {padding-top: 1rem; padding-bottom: 1rem;}
-    .stTabs [data-baseweb="tab-list"] {gap: 8px;}
-    .stTabs [data-baseweb="tab"] {
-        padding: 8px 16px;
-        border-radius: 8px 8px 0 0;
-    }
-    div[data-testid="stMetric"] {
-        background-color: #f0f2f6;
-        border-radius: 8px;
-        padding: 12px;
-    }
-    .investment-box {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 20px;
-        border-radius: 12px;
-        text-align: center;
-        margin: 10px 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.markdown("""<style>
+.block-container {padding-top: 1rem; padding-bottom: 1rem;}
+div[data-testid="stMetric"] {background-color: #f0f2f6; border-radius: 8px; padding: 12px;}
+</style>""", unsafe_allow_html=True)
 
-st.title("Symulator Energii Domu")
-st.caption("Symulacja Monte Carlo kosztów energii dla różnych konfiguracji domu")
+CURRENCY = "PLN"
+CITY_COORDS = {
+    "Wroclaw": (51.1, 17.0), "Warszawa": (52.23, 21.0),
+    "Krakow": (50.06, 19.94), "Gdansk": (54.35, 18.65),
+    "Poznan": (52.41, 16.93), "Szczecin": (53.43, 14.55),
+}
 
-
-# ── Sidebar: Configuration panels ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.header("Konfiguracja")
+    lang = st.selectbox("Language / Jezyk", ["en", "pl"],
+                        format_func=lambda x: {"en": "English", "pl": "Polski"}[x])
+    st.header(t("configuration", lang))
+
+    # ── Import / Export ──
+    with st.expander(t("import_settings", lang) + " / " + t("export_settings", lang)):
+        uploaded = st.file_uploader(t("upload_json", lang), type=["json"], key="import_json")
+        if uploaded is not None:
+            try:
+                data = json.loads(uploaded.read().decode("utf-8"))
+                st.session_state["imported_settings"] = data
+                st.success(t("settings_imported", lang))
+            except Exception:
+                st.error(t("settings_import_error", lang))
+        if st.button(t("export_settings", lang), key="btn_export"):
+            st.session_state["do_export"] = True
 
     # ── Location ──
-    with st.expander("Lokalizacja", expanded=True):
-        city_options = [
-            "Wrocław", "Warszawa", "Kraków", "Gdańsk", "Poznań", "Szczecin", "Inna"
-        ]
-        city = st.selectbox("Miasto", city_options, index=0)
-
-        if city == "Inna":
-            lat = st.number_input("Szerokość geograficzna", 49.0, 55.0, 51.1, 0.1)
-            lon = st.number_input("Długość geograficzna", 14.0, 24.0, 17.0, 0.1)
+    with st.expander(t("location", lang), expanded=True):
+        city_options = list(CITY_COORDS.keys()) + [t("other", lang)]
+        city = st.selectbox(t("city", lang), city_options, index=0)
+        if city == t("other", lang):
+            lat = st.number_input(t("latitude", lang), 49.0, 55.0,
+                                  st.session_state.get("map_lat", 51.1), 0.1)
+            lon = st.number_input(t("longitude", lang), 14.0, 24.0,
+                                  st.session_state.get("map_lon", 17.0), 0.1)
         else:
-            city_coords = {
-                "Wrocław": (51.1, 17.0), "Warszawa": (52.23, 21.0),
-                "Kraków": (50.06, 19.94), "Gdańsk": (54.35, 18.65),
-                "Poznań": (52.41, 16.93), "Szczecin": (53.43, 14.55),
-            }
-            lat, lon = city_coords[city]
-            st.caption(f"Współrzędne: {lat}°N, {lon}°E")
-
+            lat, lon = CITY_COORDS[city]
+            if "map_lat" in st.session_state and st.session_state.get("map_city_override"):
+                lat = st.session_state["map_lat"]
+                lon = st.session_state["map_lon"]
+            st.caption(t("coordinates", lang, lat=lat, lon=lon))
         location = Location(latitude=lat, longitude=lon, city_name=city)
 
     # ── House ──
-    with st.expander("Dom", expanded=True):
-        h_area = st.slider("Powierzchnia (m²)", 60, 400, 150, 10)
-        h_floors = st.selectbox("Liczba pięter", [1, 2, 3], index=1)
-        h_insulation = st.select_slider(
-            "Izolacja ścian (cm styropianu)",
-            options=[10, 15, 20, 25, 30], value=20,
-        )
-        h_window_u = st.slider("Współczynnik U okien (W/m²K)", 0.5, 1.5, 0.9, 0.1)
-        h_thermal = st.selectbox(
-            "Masa termiczna", ["low", "medium", "high"],
-            format_func=lambda x: {"low": "Niska (drewno)", "medium": "Średnia (pustak)", "high": "Wysoka (beton/cegła)"}[x],
-            index=1,
-        )
-        h_target_winter = st.slider("Temperatura zimą (°C)", 18.0, 24.0, 21.0, 0.5)
-        h_target_summer = st.slider("Temperatura latem (°C)", 22.0, 28.0, 24.0, 0.5)
-
-        house = HouseParams(
-            area_m2=h_area, floors=h_floors,
-            wall_insulation_cm=h_insulation,
-            window_u_value=h_window_u,
-            thermal_mass=h_thermal,
-            target_temp_winter_c=h_target_winter,
-            target_temp_summer_c=h_target_summer,
-        )
+    with st.expander(t("house", lang), expanded=True):
+        h_area = st.slider(t("area_m2", lang), 60, 400, 150, 10)
+        h_floors = st.selectbox(t("floors", lang), [1, 2, 3], index=1)
+        h_insulation = st.select_slider(t("wall_insulation", lang),
+                                        options=[10, 15, 20, 25, 30], value=20)
+        h_window_u = st.slider(t("window_u", lang), 0.5, 1.5, 0.9, 0.1)
+        thermal_labels = {"low": t("thermal_low", lang), "medium": t("thermal_medium", lang),
+                          "high": t("thermal_high", lang)}
+        h_thermal = st.selectbox(t("thermal_mass", lang), ["low", "medium", "high"],
+                                 format_func=lambda x: thermal_labels[x], index=1)
+        h_vent = st.slider(t("ventilation_rate", lang), 100, 500, 200, 25)
+        h_target_winter = st.slider(t("target_temp_winter", lang), 18.0, 24.0, 21.0, 0.5)
+        h_target_summer = st.slider(t("target_temp_summer", lang), 22.0, 28.0, 24.0, 0.5)
+        house = HouseParams(area_m2=h_area, floors=h_floors, wall_insulation_cm=h_insulation,
+                            window_u_value=h_window_u, thermal_mass=h_thermal,
+                            ventilation_rate_m3h=h_vent,
+                            target_temp_winter_c=h_target_winter, target_temp_summer_c=h_target_summer)
 
     # ── PV ──
-    with st.expander("Fotowoltaika", expanded=True):
-        pv_enabled = st.checkbox("Panele fotowoltaiczne", value=True)
+    with st.expander(t("pv_panels", lang), expanded=True):
+        pv_enabled = st.checkbox(t("pv_enabled", lang), value=True)
         if pv_enabled:
-            pv_kwp = st.slider("Moc szczytowa (kWp)", 2.0, 30.0, 10.0, 0.5)
-            pv_tilt = st.slider("Kąt nachylenia dachu (°)", 0, 60, 35, 5)
-            pv_azimuth = st.slider(
-                "Azymut dachu (°)", 90, 270, 180, 10,
-                help="180° = południe, 90° = wschód, 270° = zachód",
-            )
-            pv_cost = st.number_input("Koszt za kWp (PLN)", 2000, 8000, 4500, 100)
-            pv_ground = st.checkbox("Dodatkowe panele naziemne")
-            pv_ground_kwp = 0.0
-            if pv_ground:
-                pv_ground_kwp = st.slider("Moc naziemna (kWp)", 1.0, 20.0, 5.0, 0.5)
+            pv_kwp = st.slider(t("pv_peak_power", lang), 2.0, 30.0, 10.0, 0.5)
+            pv_tilt = st.slider(t("pv_roof_tilt", lang), 0, 60, 35, 5)
+            pv_azimuth = st.slider(t("pv_azimuth", lang), 90, 270, 180, 10,
+                                   help=t("pv_azimuth_help", lang))
+            pv_cost = st.number_input(t("pv_cost_per_kwp", lang, currency=CURRENCY),
+                                      2000, 8000, 4500, 100)
+            pv_ground = st.checkbox(t("pv_ground", lang))
+            pv_ground_kwp = st.slider(t("pv_ground_power", lang), 1.0, 20.0, 5.0, 0.5) if pv_ground else 0.0
         else:
-            pv_kwp = 0
-            pv_tilt = 35
-            pv_azimuth = 180
-            pv_cost = 4500
-            pv_ground = False
-            pv_ground_kwp = 0.0
-
-        pv_params = PVParams(
-            enabled=pv_enabled, peak_power_kw=pv_kwp,
-            roof_tilt_deg=pv_tilt, roof_azimuth_deg=pv_azimuth,
-            cost_per_kwp=pv_cost,
-            ground_mount_enabled=pv_ground, ground_mount_kwp=pv_ground_kwp,
-        )
+            pv_kwp, pv_tilt, pv_azimuth, pv_cost = 0, 35, 180, 4500
+            pv_ground, pv_ground_kwp = False, 0.0
+        pv_params = PVParams(enabled=pv_enabled, peak_power_kw=pv_kwp, roof_tilt_deg=pv_tilt,
+                             roof_azimuth_deg=pv_azimuth, cost_per_kwp=pv_cost,
+                             ground_mount_enabled=pv_ground, ground_mount_kwp=pv_ground_kwp)
 
     # ── Battery ──
-    with st.expander("Magazyn energii"):
-        bat_enabled = st.checkbox("Magazyn energii", value=False)
+    with st.expander(t("battery", lang)):
+        bat_enabled = st.checkbox(t("battery_enabled", lang), value=False)
         if bat_enabled:
-            bat_kwh = st.slider("Pojemność (kWh)", 2.0, 30.0, 10.0, 1.0)
-            bat_cost = st.number_input("Koszt magazynu (PLN)", 5000, 80000, 25000, 1000)
+            bat_kwh = st.slider(t("battery_capacity", lang), 2.0, 30.0, 10.0, 1.0)
+            bat_cost = st.number_input(t("battery_cost", lang, currency=CURRENCY),
+                                       5000, 80000, 25000, 1000)
         else:
-            bat_kwh = 10.0
-            bat_cost = 25000
-
-        battery = BatteryParams(
-            enabled=bat_enabled, capacity_kwh=bat_kwh, cost_total=bat_cost,
-        )
+            bat_kwh, bat_cost = 10.0, 25000
+        battery = BatteryParams(enabled=bat_enabled, capacity_kwh=bat_kwh, cost_total=bat_cost)
 
     # ── Heat Pump ──
-    with st.expander("Pompa ciepła", expanded=True):
-        hp_enabled = st.checkbox("Pompa ciepła", value=True)
+    with st.expander(t("heat_pump", lang), expanded=True):
+        hp_enabled = st.checkbox(t("hp_enabled", lang), value=True)
         if hp_enabled:
-            hp_power = st.slider("Moc grzewcza (kW)", 4.0, 16.0, 8.0, 1.0)
-            hp_cop7 = st.slider("COP przy 7°C", 2.5, 6.0, 4.0, 0.1)
-            hp_cop_m7 = st.slider("COP przy -7°C", 1.5, 4.0, 2.5, 0.1)
-            hp_cool = st.checkbox("Funkcja chłodzenia", value=True)
-            hp_cost = st.number_input("Koszt pompy (PLN)", 15000, 70000, 35000, 1000)
+            hp_power = st.slider(t("hp_power", lang), 4.0, 16.0, 8.0, 1.0)
+            hp_cop7 = st.slider(t("hp_cop_7", lang), 2.5, 6.0, 4.0, 0.1)
+            hp_cop_m7 = st.slider(t("hp_cop_m7", lang), 1.5, 4.0, 2.5, 0.1)
+            hp_cool = st.checkbox(t("hp_cooling", lang), value=True)
+            hp_cost = st.number_input(t("hp_cost", lang, currency=CURRENCY), 15000, 70000, 35000, 1000)
         else:
-            hp_power = 8.0
-            hp_cop7 = 4.0
-            hp_cop_m7 = 2.5
-            hp_cool = True
-            hp_cost = 35000
-
-        heat_pump = HeatPumpParams(
-            enabled=hp_enabled, rated_power_kw=hp_power,
-            cop_at_7c=hp_cop7, cop_at_minus7c=hp_cop_m7,
-            can_cool=hp_cool, cost_total=hp_cost,
-        )
+            hp_power, hp_cop7, hp_cop_m7, hp_cool, hp_cost = 8.0, 4.0, 2.5, True, 35000
+        heat_pump = HeatPumpParams(enabled=hp_enabled, rated_power_kw=hp_power,
+                                   cop_at_7c=hp_cop7, cop_at_minus7c=hp_cop_m7,
+                                   can_cool=hp_cool, cost_total=hp_cost)
 
     # ── Recuperator ──
-    with st.expander("Rekuperator"):
-        rec_enabled = st.checkbox("Rekuperator", value=True)
+    with st.expander(t("recuperator", lang)):
+        rec_enabled = st.checkbox(t("rec_enabled", lang), value=True)
         if rec_enabled:
-            rec_eff = st.slider("Sprawność odzysku ciepła", 0.5, 0.95, 0.85, 0.05)
-            rec_flow = st.slider("Przepływ powietrza (m³/h)", 100, 600, 300, 50)
-            rec_cost = st.number_input("Koszt rekuperatora (PLN)", 5000, 30000, 15000, 1000)
+            rec_eff = st.slider(t("rec_efficiency", lang), 0.5, 0.95, 0.85, 0.05)
+            rec_cost = st.number_input(t("rec_cost", lang, currency=CURRENCY), 5000, 30000, 15000, 1000)
         else:
-            rec_eff = 0.85
-            rec_flow = 300
-            rec_cost = 15000
-
-        recuperator = RecuperatorParams(
-            enabled=rec_enabled, efficiency=rec_eff,
-            air_flow_m3h=rec_flow, cost_total=rec_cost,
-        )
+            rec_eff, rec_cost = 0.85, 15000
+        recuperator = RecuperatorParams(enabled=rec_enabled, efficiency=rec_eff, cost_total=rec_cost)
 
     # ── AC ──
-    with st.expander("Klimatyzacja"):
-        ac_enabled = st.checkbox("Klimatyzacja (split)", value=False)
+    with st.expander(t("ac", lang)):
+        ac_enabled = st.checkbox(t("ac_enabled", lang), value=False)
         if ac_enabled:
-            ac_units = st.slider("Liczba jednostek", 1, 5, 2)
-            ac_cool_cap = st.slider("Moc chłodzenia/jedn. (kW)", 2.0, 7.0, 3.5, 0.5)
-            ac_cost_unit = st.number_input("Koszt za jednostkę (PLN)", 2000, 10000, 4000, 500)
+            ac_units = st.slider(t("ac_units", lang), 1, 5, 2)
+            ac_cool_cap = st.slider(t("ac_cooling", lang), 2.0, 7.0, 3.5, 0.5)
+            ac_cost_unit = st.number_input(t("ac_cost_unit", lang, currency=CURRENCY), 2000, 10000, 4000, 500)
         else:
-            ac_units = 2
-            ac_cool_cap = 3.5
-            ac_cost_unit = 4000
-
-        ac_params = ACParams(
-            enabled=ac_enabled, num_units=ac_units,
-            cooling_capacity_kw=ac_cool_cap, cost_per_unit=ac_cost_unit,
-        )
+            ac_units, ac_cool_cap, ac_cost_unit = 2, 3.5, 4000
+        ac_params = ACParams(enabled=ac_enabled, num_units=ac_units,
+                             cooling_capacity_kw=ac_cool_cap, cost_per_unit=ac_cost_unit)
 
     # ── Floor Heating ──
-    with st.expander("Maty grzewcze"):
-        fh_enabled = st.checkbox("Maty grzewcze podłogowe", value=False)
+    with st.expander(t("floor_heating", lang)):
+        fh_enabled = st.checkbox(t("fh_enabled", lang), value=False)
         if fh_enabled:
-            fh_area = st.slider("Powierzchnia ogrzewana (m²)", 5, 100, 30, 5)
-            fh_power = st.slider("Moc na m² (W/m²)", 100, 200, 150, 10)
+            fh_area = st.slider(t("fh_area", lang), 5, 100, 30, 5)
+            fh_power = st.slider(t("fh_power", lang), 100, 200, 150, 10)
+            fh_cost_m2 = st.number_input(t("fh_cost_per_m2", lang, currency=CURRENCY), 50, 500, 200, 25)
         else:
-            fh_area = 30
-            fh_power = 150
+            fh_area, fh_power, fh_cost_m2 = 30, 150, 200
+        floor_heating = FloorHeatingParams(enabled=fh_enabled, area_m2=fh_area,
+                                           power_per_m2_w=fh_power, cost_per_m2=fh_cost_m2)
 
-        floor_heating = FloorHeatingParams(
-            enabled=fh_enabled, area_m2=fh_area, power_per_m2_w=fh_power,
-        )
-
-    # ── Appliances ──
-    with st.expander("Urządzenia domowe"):
-        st.caption("Dostosuj zużycie urządzeń")
-        default_app = AppliancesParams()
+    # ── Appliances (with power editing) ──
+    with st.expander(t("appliances", lang)):
+        st.caption(t("appliances_hint", lang))
+        defaults = default_appliances()
         custom_appliances = []
-        for app in default_app.appliances:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                hours = st.number_input(
-                    f"{app.name} - godziny/dzień",
-                    0.0, 24.0, float(app.daily_hours), 0.1,
-                    key=f"app_h_{app.name}",
-                )
-            with col2:
-                count = st.number_input(
-                    "szt.",
-                    0, 10, app.count, 1,
-                    key=f"app_c_{app.name}",
-                )
-            custom_appliances.append(Appliance(
-                name=app.name, power_w=app.power_w,
-                daily_hours=hours, count=count, standby_w=app.standby_w,
-            ))
-        hw_kwh = st.slider("Ciepła woda (kWh/dzień)", 2.0, 15.0, 6.0, 0.5)
-
+        for app in defaults:
+            tr_key = APPLIANCE_KEY_MAP.get(app.name, app.name)
+            display_name = t(tr_key, lang)
+            c1, c2, c3 = st.columns([3, 2, 1])
+            with c1:
+                hours = st.number_input(f"{display_name} - {t('hours_per_day', lang)}",
+                                        0.0, 24.0, float(app.daily_hours), 0.1,
+                                        key=f"app_h_{app.name}")
+            with c2:
+                power = st.number_input(f"{t('power_watts', lang)}",
+                                        1, 10000, int(app.power_w), 10,
+                                        key=f"app_w_{app.name}")
+            with c3:
+                count = st.number_input(t("pieces", lang), 0, 10, app.count, 1,
+                                        key=f"app_c_{app.name}")
+            custom_appliances.append(Appliance(name=display_name, power_w=power,
+                                               daily_hours=hours, count=count, standby_w=app.standby_w))
+        hw_kwh = st.slider(t("hot_water", lang), 2.0, 15.0, 5.0, 0.5)
         appliances = AppliancesParams(appliances=custom_appliances, hot_water_daily_kwh=hw_kwh)
 
     # ── Tariff ──
-    with st.expander("Taryfa elektryczna", expanded=True):
-        dual = st.checkbox("Taryfa dwustrefowa (dzień/noc)", value=False)
+    with st.expander(t("tariff", lang), expanded=True):
+        dual = st.checkbox(t("dual_tariff", lang), value=False)
         if dual:
-            t_day = st.number_input("Cena dzień (PLN/kWh)", 0.30, 2.00, 0.75, 0.05)
-            t_night = st.number_input("Cena noc (PLN/kWh)", 0.20, 1.50, 0.45, 0.05)
+            t_day = st.number_input(t("price_day", lang, currency=CURRENCY), 0.30, 2.00, 0.75, 0.05)
+            t_night = st.number_input(t("price_night", lang, currency=CURRENCY), 0.20, 1.50, 0.45, 0.05)
             t_single = (t_day + t_night) / 2
         else:
-            t_single = st.number_input("Cena prądu (PLN/kWh)", 0.30, 2.00, 0.65, 0.05)
-            t_day = t_single
-            t_night = t_single
-
-        t_feed = st.number_input("Cena odkupu (PLN/kWh)", 0.0, 1.50, 0.40, 0.05)
-        t_fixed = st.number_input("Opłata stała miesięczna (PLN)", 0.0, 200.0, 30.0, 5.0)
-        t_increase = st.slider("Roczny wzrost cen (%)", 0, 15, 3) / 100.0
-
-        tariff = TariffParams(
-            price_per_kwh=t_single, dual_tariff=dual,
-            day_price=t_day, night_price=t_night,
-            feed_in_tariff=t_feed, fixed_monthly_cost=t_fixed,
-            annual_price_increase=t_increase,
-        )
+            t_single = st.number_input(t("price_single", lang, currency=CURRENCY), 0.30, 2.00, 0.65, 0.05)
+            t_day = t_night = t_single
+        t_feed = st.number_input(t("feed_in", lang, currency=CURRENCY), 0.0, 1.50, 0.40, 0.05)
+        t_fixed = st.number_input(t("fixed_monthly", lang, currency=CURRENCY), 0.0, 200.0, 30.0, 5.0)
+        t_increase = st.slider(t("annual_increase", lang), 0, 15, 3) / 100.0
+        tariff = TariffParams(price_per_kwh=t_single, dual_tariff=dual, day_price=t_day,
+                              night_price=t_night, feed_in_tariff=t_feed,
+                              fixed_monthly_cost=t_fixed, annual_price_increase=t_increase)
 
     # ── Simulation ──
-    with st.expander("Parametry symulacji"):
-        sim_years = st.slider("Okres symulacji (lata)", 1, 30, 10)
-        sim_n = st.slider("Liczba symulacji Monte Carlo", 10, 1000, 200, 10)
-        sim_seed = st.number_input("Ziarno losowe (0 = losowe)", 0, 99999, 0)
+    with st.expander(t("sim_params", lang)):
+        sim_years = st.slider(t("sim_years", lang), 1, 30, 10)
+        sim_n = st.slider(t("sim_runs", lang), 3, 300, 9, 3,
+                          help="3 scenarios (cold/normal/warm) x N repeats")
+        sim_seed = st.number_input(t("sim_seed", lang), 0, 99999, 0)
+        sim_params = SimulationParams(years=sim_years, num_simulations=sim_n,
+                                      random_seed=sim_seed if sim_seed > 0 else None)
 
-        sim_params = SimulationParams(
-            years=sim_years, num_simulations=sim_n,
-            random_seed=sim_seed if sim_seed > 0 else None,
-        )
+# Investment total
+total_inv = 0.0
+if pv_params.enabled: total_inv += pv_params.total_cost
+if battery.enabled: total_inv += battery.cost_total
+if heat_pump.enabled: total_inv += heat_pump.cost_total
+if recuperator.enabled: total_inv += recuperator.cost_total
+if ac_params.enabled: total_inv += ac_params.total_cost
+if floor_heating.enabled: total_inv += floor_heating.total_cost
 
+# Handle export
+if st.session_state.get("do_export"):
+    export_data = params_to_dict(location, house, pv_params, battery, heat_pump,
+                                 recuperator, ac_params, floor_heating, appliances, tariff, sim_params)
+    st.session_state["do_export"] = False
+    st.sidebar.download_button("Download JSON", json.dumps(export_data, indent=2, ensure_ascii=False),
+                               "energy_sim_settings.json", "application/json")
 
-# ── Main area ───────────────────────────────────────────────────────────────
+# ── Title ──
+st.title(t("app_title", lang))
+st.caption(t("app_subtitle", lang))
 
-tab_overview, tab_results, tab_weather, tab_details = st.tabs([
-    "Przegląd konfiguracji", "Wyniki symulacji",
-    "Model pogody", "Szczegóły techniczne",
+tab_map, tab_results, tab_energy, tab_weather, tab_details = st.tabs([
+    t("tab_map", lang), t("tab_results", lang),
+    t("hourly_profiles", lang), t("tab_weather", lang), t("tab_details", lang),
 ])
 
-with tab_overview:
-    st.subheader("Konfiguracja systemu")
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 1: Map
+# ══════════════════════════════════════════════════════════════════════════
 
-    col1, col2, col3 = st.columns(3)
+def _house_polygon(lat, lon, azimuth_deg, size_m=40):
+    w, d, peak = size_m / 2, size_m / 2, size_m * 0.35
+    pts = [(-w, -d), (w, -d), (w, d), (0, d + peak), (-w, d)]
+    a = math.radians(azimuth_deg - 180)
+    ca, sa = math.cos(a), math.sin(a)
+    mlat, mlon = 111320.0, 111320.0 * math.cos(math.radians(lat))
+    coords = [[lat + (x * sa + y * ca) / mlat, lon + (x * ca - y * sa) / mlon] for x, y in pts]
+    coords.append(coords[0])
+    return coords
 
-    with col1:
-        st.markdown("**Dom**")
-        st.write(f"- Lokalizacja: {location.city_name}")
-        st.write(f"- Powierzchnia: {house.area_m2} m²")
-        st.write(f"- Piętra: {house.floors}")
-        st.write(f"- Izolacja: {house.wall_insulation_cm} cm")
-        st.write(f"- Okna U={house.window_u_value} W/m²K")
-        st.write(f"- Współczynnik strat: {house.envelope_loss_coefficient:.0f} W/K")
+def _pv_polygon(lat, lon, azimuth_deg, size_m=40):
+    w, d, peak = size_m / 2 * 0.8, size_m / 2, size_m * 0.35
+    pts = [(-w * 0.9, d * 0.3), (w * 0.9, d * 0.3), (0, d + peak * 0.85)]
+    a = math.radians(azimuth_deg - 180)
+    ca, sa = math.cos(a), math.sin(a)
+    mlat, mlon = 111320.0, 111320.0 * math.cos(math.radians(lat))
+    coords = [[lat + (x * sa + y * ca) / mlat, lon + (x * ca - y * sa) / mlon] for x, y in pts]
+    coords.append(coords[0])
+    return coords
 
-    with col2:
-        st.markdown("**Systemy energetyczne**")
-        if pv_params.enabled:
-            st.write(f"- PV: {pv_params.total_kwp:.1f} kWp")
-        if battery.enabled:
-            st.write(f"- Magazyn: {battery.capacity_kwh} kWh")
-        if heat_pump.enabled:
-            st.write(f"- Pompa ciepła: {heat_pump.rated_power_kw} kW")
-        if recuperator.enabled:
-            st.write(f"- Rekuperator: {recuperator.efficiency*100:.0f}%")
-        if ac_params.enabled:
-            st.write(f"- Klimatyzacja: {ac_params.num_units}x {ac_params.cooling_capacity_kw} kW")
-        if floor_heating.enabled:
-            st.write(f"- Maty grzewcze: {floor_heating.area_m2} m²")
+with tab_map:
+    st.subheader(t("map_header", lang))
+    st.caption(t("map_hint", lang))
+    map_col, info_col = st.columns([3, 2])
 
-    with col3:
-        st.markdown("**Koszty inwestycji**")
-        total_inv = 0
-        items = []
-        if pv_params.enabled:
-            items.append(("Fotowoltaika", pv_params.total_cost))
-        if battery.enabled:
-            items.append(("Magazyn energii", battery.cost_total))
-        if heat_pump.enabled:
-            items.append(("Pompa ciepła", heat_pump.cost_total))
-        if recuperator.enabled:
-            items.append(("Rekuperator", recuperator.cost_total))
-        if ac_params.enabled:
-            items.append(("Klimatyzacja", ac_params.total_cost))
-        if floor_heating.enabled:
-            items.append(("Maty grzewcze", floor_heating.total_cost))
+    with map_col:
+        m = folium.Map(location=[lat, lon], zoom_start=17, tiles="OpenStreetMap")
+        azimuth = pv_azimuth if pv_enabled else 180
+        folium.Polygon(locations=_house_polygon(lat, lon, azimuth), color="#5C6BC0",
+                       fill=True, fill_color="#7986CB", fill_opacity=0.6, weight=2,
+                       tooltip=f"{t('house', lang)}: {house.area_m2}m\u00b2").add_to(m)
+        if pv_enabled:
+            folium.Polygon(locations=_pv_polygon(lat, lon, azimuth), color="#F57F17",
+                           fill=True, fill_color="#FFD54F", fill_opacity=0.7, weight=2,
+                           tooltip=f"PV: {pv_params.total_kwp:.1f} kWp").add_to(m)
+        # Direction arrow
+        mlat, mlon = 111320.0, 111320.0 * math.cos(math.radians(lat))
+        ae_lat = lat + 60 * math.cos(math.radians(180 - azimuth)) / mlat
+        ae_lon = lon + 60 * math.sin(math.radians(azimuth - 180)) / mlon
+        dir_labels = {0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW"}
+        dir_label = dir_labels[min(dir_labels, key=lambda d: abs(d - azimuth))]
+        folium.PolyLine([[lat, lon], [ae_lat, ae_lon]], color="#E53935", weight=3, dash_array="8",
+                        tooltip=f"{t('roof_direction', lang)}: {azimuth}\u00b0 ({dir_label})").add_to(m)
+        folium.Marker([ae_lat, ae_lon], icon=folium.DivIcon(
+            html=f'<div style="font-size:14px;font-weight:bold;color:#E53935">{dir_label}</div>',
+            icon_size=(30, 20), icon_anchor=(15, 10))).add_to(m)
+        map_data = st_folium(m, width=None, height=500, returned_objects=["last_clicked"])
+        if map_data and map_data.get("last_clicked"):
+            c = map_data["last_clicked"]
+            nl, no = round(c["lat"], 4), round(c["lng"], 4)
+            if abs(nl - lat) > 0.0001 or abs(no - lon) > 0.0001:
+                st.session_state["map_lat"] = nl
+                st.session_state["map_lon"] = no
+                st.session_state["map_city_override"] = True
+                st.rerun()
+        st.caption(f"{t('current_location', lang)}: {lat:.4f}\u00b0N, {lon:.4f}\u00b0E")
 
-        for name, cost in items:
-            st.write(f"- {name}: {cost:,.0f} PLN")
-            total_inv += cost
-        st.markdown(f"**Razem: {total_inv:,.0f} PLN**")
+    with info_col:
+        st.markdown(f"**{t('house_label', lang)}**")
+        st.write(f"- {t('area_label', lang)}: {house.area_m2} m\u00b2 | {t('floors_label', lang)}: {house.floors}")
+        st.write(f"- {t('insulation_label', lang)}: {house.wall_insulation_cm} cm | {t('windows_label', lang)}: {house.window_u_value}")
+        st.write(f"- {t('heat_loss_label', lang)}: {house.envelope_loss_coefficient:.0f} W/K "
+                 f"(trans: {house.transmission_loss_coefficient:.0f}, vent: {house.ventilation_loss_coefficient:.0f}, "
+                 f"infil: {house.infiltration_loss_coefficient:.0f})")
 
-    st.divider()
+        st.markdown(f"**{t('energy_systems', lang)}**")
+        if pv_params.enabled: st.write(f"- PV: {pv_params.total_kwp:.1f} kWp ({azimuth}\u00b0)")
+        if battery.enabled: st.write(f"- {t('battery', lang)}: {battery.capacity_kwh} kWh")
+        if heat_pump.enabled: st.write(f"- {t('heat_pump', lang)}: {heat_pump.rated_power_kw} kW")
+        if recuperator.enabled: st.write(f"- {t('recuperator', lang)}: {recuperator.efficiency*100:.0f}%")
+        if ac_params.enabled: st.write(f"- {t('ac', lang)}: {ac_params.num_units}x {ac_params.cooling_capacity_kw} kW")
+        if floor_heating.enabled: st.write(f"- {t('floor_heating', lang)}: {floor_heating.area_m2} m\u00b2")
 
-    st.subheader("Zużycie bazowe urządzeń")
-    app_data = []
-    for a in appliances.appliances:
-        app_data.append({
-            "Urządzenie": a.name,
-            "Moc (W)": a.power_w,
-            "Godziny/dzień": a.daily_hours,
-            "Sztuk": a.count,
-            "kWh/dzień": round(a.daily_kwh, 2),
-        })
-    df_app = pd.DataFrame(app_data)
-    st.dataframe(df_app, use_container_width=True, hide_index=True)
-    st.write(f"**Łączne zużycie bazowe: {appliances.base_daily_kwh:.1f} kWh/dzień "
-             f"({appliances.base_daily_kwh * 365:.0f} kWh/rok)**")
+        st.markdown(f"**{t('investment_costs', lang)}**")
+        for name, cost in [(t("pv_panels", lang), pv_params.total_cost)] * pv_params.enabled + \
+                          [(t("battery", lang), battery.cost_total)] * battery.enabled + \
+                          [(t("heat_pump", lang), heat_pump.cost_total)] * heat_pump.enabled + \
+                          [(t("recuperator", lang), recuperator.cost_total)] * recuperator.enabled + \
+                          [(t("ac", lang), ac_params.total_cost)] * ac_params.enabled + \
+                          [(t("floor_heating", lang), floor_heating.total_cost)] * floor_heating.enabled:
+            st.write(f"- {name}: {cost:,.0f} {CURRENCY}")
+        st.markdown(f"**{t('total', lang)}: {total_inv:,.0f} {CURRENCY}**")
+        st.divider()
+        st.write(f"**{t('base_consumption', lang)}:** {appliances.base_daily_kwh:.1f} kWh{t('per_day', lang)} "
+                 f"({appliances.base_daily_kwh * 365:.0f} kWh{t('per_year', lang)})")
 
-
-# ── Run simulation ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 2: Simulation Results
+# ══════════════════════════════════════════════════════════════════════════
 
 with tab_results:
-    if st.button("Uruchom symulację", type="primary", use_container_width=True):
-        progress_bar = st.progress(0.0, text="Trwa symulacja Monte Carlo...")
-
+    if st.button(t("run_simulation", lang), type="primary", use_container_width=True):
+        progress_bar = st.progress(0.0, text=t("simulation_running", lang))
         def update_progress(frac):
-            progress_bar.progress(frac, text=f"Symulacja: {frac*100:.0f}%")
-
-        result = run_monte_carlo(
-            location, house, pv_params, battery, heat_pump,
-            recuperator, ac_params, floor_heating, appliances,
-            tariff, sim_params,
-            progress_callback=update_progress,
-        )
+            progress_bar.progress(frac, text=t("simulation_progress", lang, pct=frac * 100))
+        result = run_monte_carlo(location, house, pv_params, battery, heat_pump,
+                                 recuperator, ac_params, floor_heating, appliances,
+                                 tariff, sim_params, progress_callback=update_progress)
         progress_bar.empty()
-
         st.session_state["result"] = result
-        st.session_state["sim_params"] = sim_params
-        st.session_state["investment"] = total_inv
+        st.session_state["sim_params_r"] = sim_params
+        st.session_state["investment_r"] = total_inv
 
     if "result" in st.session_state:
         result = st.session_state["result"]
-        sim_p = st.session_state["sim_params"]
-        investment = st.session_state["investment"]
+        sim_p = st.session_state["sim_params_r"]
+        investment = st.session_state["investment_r"]
 
-        st.subheader("Podsumowanie kosztów")
+        # ── Scenario comparison table ──
+        if result.scenario_year1:
+            st.subheader(t("scenario_comparison", lang))
+            sc_data = []
+            for yr in result.scenario_year1:
+                sc_name = {"cold": t("scenario_cold", lang), "normal": t("scenario_normal", lang),
+                           "warm": t("scenario_warm", lang)}.get(yr.scenario_name, yr.scenario_name)
+                sc_data.append({
+                    "": sc_name,
+                    t("total_consumption", lang): f"{yr.total_consumption_kwh:,.0f} kWh",
+                    t("heating_thermal", lang): f"{yr.heating_kwh_thermal:,.0f} kWh",
+                    t("heating_electric", lang): f"{yr.heating_kwh_electric:,.0f} kWh",
+                    t("pv_generation", lang): f"{yr.total_pv_generation_kwh:,.0f} kWh",
+                    t("grid_import_label", lang): f"{yr.grid_imported_kwh:,.0f} kWh",
+                    t("net_cost_label", lang): f"{yr.net_cost_pln:,.0f} {CURRENCY}",
+                })
+            st.dataframe(pd.DataFrame(sc_data), use_container_width=True, hide_index=True)
 
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric(
-                f"Koszt energii ({sim_p.years} lat)",
-                f"{result.total_net_cost_mean:,.0f} PLN",
-                help="Średni koszt netto energii z sieci (po odliczeniu sprzedaży)",
-            )
-        with col2:
-            total_with_inv = result.total_net_cost_mean + investment
-            st.metric(
-                "Koszt łączny z inwestycją",
-                f"{total_with_inv:,.0f} PLN",
-            )
-        with col3:
-            annual_avg = result.total_net_cost_mean / sim_p.years
-            monthly_avg = annual_avg / 12
-            st.metric("Średnio miesięcznie", f"{monthly_avg:,.0f} PLN")
-        with col4:
-            st.metric(
-                "Rozrzut (5%-95%)",
-                f"{result.total_net_cost_p5:,.0f} - {result.total_net_cost_p95:,.0f} PLN",
-            )
+        st.subheader(t("cost_summary", lang))
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric(t("energy_cost_period", lang, years=sim_p.years),
+                      f"{result.total_net_cost_mean:,.0f} {CURRENCY}",
+                      help=t("cost_help", lang))
+        with c2:
+            st.metric(t("total_with_investment", lang),
+                      f"{result.total_net_cost_mean + investment:,.0f} {CURRENCY}")
+        with c3:
+            st.metric(t("monthly_average", lang),
+                      f"{result.total_net_cost_mean / sim_p.years / 12:,.0f} {CURRENCY}")
+        with c4:
+            st.metric(t("spread_5_95", lang),
+                      f"{result.total_net_cost_p5:,.0f} - {result.total_net_cost_p95:,.0f}")
 
         st.divider()
 
-        # ── Annual costs chart ──
-        st.subheader("Koszty roczne")
+        # Annual costs chart
+        st.subheader(t("annual_costs", lang))
         annual_df = result.annual_costs
         years = list(range(1, sim_p.years + 1))
-
         means = annual_df.mean()
-        p5 = annual_df.quantile(0.05)
-        p25 = annual_df.quantile(0.25)
-        p75 = annual_df.quantile(0.75)
-        p95 = annual_df.quantile(0.95)
+        p5, p25, p75, p95 = (annual_df.quantile(q) for q in [0.05, 0.25, 0.75, 0.95])
+        fig_a = go.Figure()
+        fig_a.add_trace(go.Scatter(x=years, y=p95.values, mode="lines", line=dict(width=0), showlegend=False))
+        fig_a.add_trace(go.Scatter(x=years, y=p5.values, mode="lines", line=dict(width=0),
+                                   fill="tonexty", fillcolor="rgba(255,107,53,0.15)", name=t("range_5_95", lang)))
+        fig_a.add_trace(go.Scatter(x=years, y=p75.values, mode="lines", line=dict(width=0), showlegend=False))
+        fig_a.add_trace(go.Scatter(x=years, y=p25.values, mode="lines", line=dict(width=0),
+                                   fill="tonexty", fillcolor="rgba(255,107,53,0.3)", name=t("range_25_75", lang)))
+        fig_a.add_trace(go.Scatter(x=years, y=means.values, mode="lines+markers",
+                                   line=dict(color="#FF6B35", width=3), name=t("mean", lang)))
+        fig_a.update_layout(xaxis_title=t("year", lang), yaxis_title=t("net_cost_year", lang),
+                            template="plotly_white", height=400)
+        st.plotly_chart(fig_a, use_container_width=True)
 
-        fig_annual = go.Figure()
-        fig_annual.add_trace(go.Scatter(
-            x=years, y=p95.values, mode="lines", line=dict(width=0),
-            showlegend=False, name="P95",
-        ))
-        fig_annual.add_trace(go.Scatter(
-            x=years, y=p5.values, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(255,107,53,0.15)",
-            showlegend=True, name="Zakres 5-95%",
-        ))
-        fig_annual.add_trace(go.Scatter(
-            x=years, y=p75.values, mode="lines", line=dict(width=0),
-            showlegend=False,
-        ))
-        fig_annual.add_trace(go.Scatter(
-            x=years, y=p25.values, mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(255,107,53,0.3)",
-            showlegend=True, name="Zakres 25-75%",
-        ))
-        fig_annual.add_trace(go.Scatter(
-            x=years, y=means.values, mode="lines+markers",
-            line=dict(color="#FF6B35", width=3),
-            name="Średnia",
-        ))
-        fig_annual.update_layout(
-            xaxis_title="Rok", yaxis_title="Koszt netto (PLN/rok)",
-            template="plotly_white", height=400,
-        )
-        st.plotly_chart(fig_annual, use_container_width=True)
+        # Energy balance
+        st.subheader(t("energy_balance", lang))
+        fy = [run[0] for run in result.year_results]
+        avg = lambda attr: np.mean([getattr(y, attr) for y in fy])
+        avg_gen = avg("total_pv_generation_kwh")
+        avg_cons = avg("total_consumption_kwh")
+        avg_self = avg("pv_self_consumed_kwh")
+        avg_export = avg("pv_exported_kwh")
+        avg_grid = avg("grid_imported_kwh")
+        avg_heat = avg("heating_kwh_electric")
+        avg_cool = avg("cooling_kwh_electric")
+        avg_hw = avg("hot_water_kwh_electric")
+        avg_appl = avg("appliances_kwh")
 
-        # ── Energy balance (first year average) ──
-        st.subheader("Bilans energetyczny (średnio, rok 1)")
-
-        first_year_data = [run[0] for run in result.year_results]
-        avg_gen = np.mean([y.total_pv_generation_kwh for y in first_year_data])
-        avg_cons = np.mean([y.total_consumption_kwh for y in first_year_data])
-        avg_self = np.mean([y.pv_self_consumed_kwh for y in first_year_data])
-        avg_export = np.mean([y.pv_exported_kwh for y in first_year_data])
-        avg_grid = np.mean([y.grid_imported_kwh for y in first_year_data])
-        avg_heat = np.mean([y.heating_kwh_electric for y in first_year_data])
-        avg_cool = np.mean([y.cooling_kwh_electric for y in first_year_data])
-        avg_hw = np.mean([y.hot_water_kwh_electric for y in first_year_data])
-        avg_appl = np.mean([y.appliances_kwh for y in first_year_data])
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            fig_gen = go.Figure(data=[go.Pie(
-                labels=["Autokonsumpcja", "Eksport do sieci"],
-                values=[avg_self, avg_export],
-                marker_colors=["#FF6B35", "#FFC107"],
-                hole=0.4,
-            )])
-            fig_gen.update_layout(
-                title=f"Produkcja PV: {avg_gen:,.0f} kWh/rok",
-                height=350,
-            )
-            st.plotly_chart(fig_gen, use_container_width=True)
-
-        with col2:
-            fig_cons = go.Figure(data=[go.Pie(
-                labels=["Ogrzewanie", "Chłodzenie", "Ciepła woda", "Urządzenia"],
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = go.Figure(data=[go.Pie(labels=[t("self_consumption", lang), t("grid_export", lang)],
+                                         values=[avg_self, avg_export],
+                                         marker_colors=["#FF6B35", "#FFC107"], hole=0.4)])
+            fig.update_layout(title=t("pv_production", lang, val=avg_gen), height=350)
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            fig = go.Figure(data=[go.Pie(
+                labels=[t("heating", lang), t("cooling", lang), t("hot_water_label", lang), t("appliances_label", lang)],
                 values=[avg_heat, avg_cool, avg_hw, avg_appl],
-                marker_colors=["#E53935", "#42A5F5", "#FF9800", "#66BB6A"],
-                hole=0.4,
-            )])
-            fig_cons.update_layout(
-                title=f"Zużycie: {avg_cons:,.0f} kWh/rok",
-                height=350,
-            )
-            st.plotly_chart(fig_cons, use_container_width=True)
+                marker_colors=["#E53935", "#42A5F5", "#FF9800", "#66BB6A"], hole=0.4)])
+            fig.update_layout(title=t("consumption_label", lang, val=avg_cons), height=350)
+            st.plotly_chart(fig, use_container_width=True)
 
-        # Key metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
+        c1, c2, c3 = st.columns(3)
+        with c1:
             autarky = (1 - avg_grid / avg_cons) * 100 if avg_cons > 0 else 0
-            st.metric("Autarkia energetyczna", f"{autarky:.0f}%",
-                      help="Procent zużycia pokrytego z własnej produkcji")
-        with col2:
-            self_cons_rate = (avg_self / avg_gen) * 100 if avg_gen > 0 else 0
-            st.metric("Autokonsumpcja PV", f"{self_cons_rate:.0f}%",
-                      help="Procent produkcji PV zużytej na miejscu")
-        with col3:
-            st.metric("Pobór z sieci", f"{avg_grid:,.0f} kWh/rok")
+            st.metric(t("energy_autarky", lang), f"{autarky:.0f}%", help=t("autarky_help", lang))
+        with c2:
+            sc_rate = (avg_self / avg_gen) * 100 if avg_gen > 0 else 0
+            st.metric(t("pv_self_consumption", lang), f"{sc_rate:.0f}%", help=t("self_consumption_help", lang))
+        with c3:
+            st.metric(t("grid_import", lang), f"{avg_grid:,.0f} kWh/yr")
 
-        # ── Distribution histogram ──
-        st.subheader("Rozkład łącznych kosztów (Monte Carlo)")
-        total_costs = [sum(yr.net_cost_pln for yr in run) for run in result.year_results]
-        fig_hist = go.Figure(data=[go.Histogram(
-            x=total_costs, nbinsx=40,
-            marker_color="#FF6B35", opacity=0.8,
-        )])
-        fig_hist.add_vline(x=np.mean(total_costs), line_dash="dash",
-                          line_color="red", annotation_text="Średnia")
-        fig_hist.update_layout(
-            xaxis_title=f"Łączny koszt netto ({sim_p.years} lat, PLN)",
-            yaxis_title="Liczba symulacji",
-            template="plotly_white", height=350,
-        )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        # Histogram
+        st.subheader(t("cost_distribution", lang))
+        tc = [sum(yr.net_cost_pln for yr in run) for run in result.year_results]
+        fig_h = go.Figure(data=[go.Histogram(x=tc, nbinsx=30, marker_color="#FF6B35", opacity=0.8)])
+        fig_h.add_vline(x=np.mean(tc), line_dash="dash", line_color="red", annotation_text=t("mean", lang))
+        fig_h.update_layout(xaxis_title=t("total_net_cost", lang, years=sim_p.years, currency=CURRENCY),
+                            yaxis_title=t("simulation_count", lang), template="plotly_white", height=350)
+        st.plotly_chart(fig_h, use_container_width=True)
 
-        # ── ROI analysis ──
+        # ROI
         if investment > 0:
-            st.subheader("Analiza zwrotu inwestycji")
-
-            # Compare with no-systems scenario (rough)
-            no_pv_annual = avg_cons * tariff.price_per_kwh
-            with_systems_annual = result.total_net_cost_mean / sim_p.years
-            annual_savings = no_pv_annual - with_systems_annual
-
-            if annual_savings > 0:
-                payback = investment / annual_savings
-                st.metric("Szacowany okres zwrotu", f"{payback:.1f} lat",
-                         help="Uproszczony - nie uwzględnia dyskontowania")
-
-            # Cumulative cost comparison
-            fig_roi = go.Figure()
-            cum_no_sys = []
-            cum_with_sys = [investment]
-            for y in range(1, sim_p.years + 1):
-                esc = (1 + tariff.annual_price_increase) ** (y - 1)
-                cum_no_sys.append(no_pv_annual * esc)
-                cum_with_sys.append(cum_with_sys[-1] + means.values[y-1])
-
-            cum_no_sys = np.cumsum(cum_no_sys)
-            cum_with_sys = np.array(cum_with_sys[1:])
-
-            fig_roi.add_trace(go.Scatter(
-                x=list(range(1, sim_p.years + 1)), y=cum_no_sys,
-                name="Bez systemu", line=dict(color="gray", dash="dash"),
-            ))
-            fig_roi.add_trace(go.Scatter(
-                x=list(range(1, sim_p.years + 1)), y=cum_with_sys,
-                name="Z systemem (+ inwestycja)", line=dict(color="#FF6B35"),
-            ))
-            fig_roi.update_layout(
-                xaxis_title="Rok", yaxis_title="Skumulowany koszt (PLN)",
-                template="plotly_white", height=400,
-            )
-            st.plotly_chart(fig_roi, use_container_width=True)
-
+            st.subheader(t("roi_analysis", lang))
+            no_sys = avg_cons * tariff.price_per_kwh
+            with_sys = result.total_net_cost_mean / sim_p.years
+            savings = no_sys - with_sys
+            if savings > 0:
+                st.metric(t("estimated_payback", lang), f"{investment / savings:.1f} {t('years_unit', lang)}",
+                         help=t("payback_help", lang))
+            fig_r = go.Figure()
+            cum_no = np.cumsum([no_sys * (1 + tariff.annual_price_increase) ** (y-1) for y in years])
+            cum_with = investment + np.cumsum(means.values)
+            fig_r.add_trace(go.Scatter(x=years, y=cum_no, name=t("without_system", lang),
+                                       line=dict(color="gray", dash="dash")))
+            fig_r.add_trace(go.Scatter(x=years, y=cum_with, name=t("with_system", lang),
+                                       line=dict(color="#FF6B35")))
+            fig_r.update_layout(xaxis_title=t("year", lang),
+                                yaxis_title=t("cumulative_cost", lang, currency=CURRENCY),
+                                template="plotly_white", height=400)
+            st.plotly_chart(fig_r, use_container_width=True)
     else:
-        st.info("Kliknij 'Uruchom symulację' aby zobaczyć wyniki.")
+        st.info(t("click_to_run", lang))
 
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 3: Hourly Energy Profiles
+# ══════════════════════════════════════════════════════════════════════════
 
-# ── Weather tab ─────────────────────────────────────────────────────────────
+with tab_energy:
+    if "result" in st.session_state and st.session_state["result"].scenario_year1:
+        scenario_data = st.session_state["result"].scenario_year1
+        scenario_names = {
+            "cold": t("scenario_cold", lang),
+            "normal": t("scenario_normal", lang),
+            "warm": t("scenario_warm", lang),
+        }
+        # Pick scenario to show
+        options = [yr.scenario_name for yr in scenario_data if yr.hourly_pv is not None]
+        if options:
+            chosen = st.selectbox("Scenario", options,
+                                  format_func=lambda x: scenario_names.get(x, x))
+            yr = [y for y in scenario_data if y.scenario_name == chosen and y.hourly_pv is not None][0]
+
+            # Weekly averages for cleaner plots
+            weeks = 52
+            def weekly(arr):
+                return np.array([arr[w*168:(w+1)*168].mean() for w in range(weeks)])
+
+            w_pv = weekly(yr.hourly_pv)
+            w_demand = weekly(yr.hourly_demand)
+            w_grid = weekly(yr.hourly_grid)
+            w_heat = weekly(yr.hourly_heating)
+            week_nums = list(range(1, weeks + 1))
+
+            # PV vs Demand
+            st.subheader(t("pv_vs_demand", lang) + f" ({t('weekly_avg', lang)})")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=week_nums, y=w_demand, name=t("demand_monthly", lang),
+                                     fill="tozeroy", fillcolor="rgba(229,57,53,0.2)",
+                                     line=dict(color="#E53935")))
+            fig.add_trace(go.Scatter(x=week_nums, y=w_pv, name=t("pv_gen_monthly", lang),
+                                     fill="tozeroy", fillcolor="rgba(255,193,7,0.3)",
+                                     line=dict(color="#FFC107")))
+            fig.add_trace(go.Scatter(x=week_nums, y=w_heat, name=t("heating", lang),
+                                     line=dict(color="#FF6B35", dash="dot")))
+            fig.update_layout(xaxis_title=f"Week", yaxis_title=t("kwh", lang),
+                              template="plotly_white", height=400)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Battery SOC
+            if battery.enabled and yr.hourly_battery_soc is not None:
+                st.subheader(t("battery_soc", lang))
+                w_soc = weekly(yr.hourly_battery_soc)
+                fig_b = go.Figure()
+                fig_b.add_trace(go.Scatter(x=week_nums, y=w_soc,
+                                           fill="tozeroy", fillcolor="rgba(92,107,192,0.3)",
+                                           line=dict(color="#5C6BC0"), name="SOC"))
+                fig_b.update_layout(xaxis_title="Week", yaxis_title="kWh",
+                                    template="plotly_white", height=300)
+                st.plotly_chart(fig_b, use_container_width=True)
+
+            # Monthly energy balance
+            st.subheader(t("monthly_energy", lang))
+            days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            months_labels = t("months", lang)
+            m_pv, m_demand, m_grid = [], [], []
+            start = 0
+            for d in days_in_month:
+                end = start + d * 24
+                m_pv.append(yr.hourly_pv[start:end].sum())
+                m_demand.append(yr.hourly_demand[start:end].sum())
+                m_grid.append(max(0, yr.hourly_grid[start:end].sum()))
+                start = end
+
+            fig_m = go.Figure()
+            fig_m.add_trace(go.Bar(x=months_labels, y=m_demand, name=t("demand_monthly", lang),
+                                   marker_color="#E53935"))
+            fig_m.add_trace(go.Bar(x=months_labels, y=m_pv, name=t("pv_gen_monthly", lang),
+                                   marker_color="#FFC107"))
+            fig_m.add_trace(go.Bar(x=months_labels, y=m_grid, name=t("grid_monthly", lang),
+                                   marker_color="#78909C"))
+            fig_m.update_layout(barmode="group", template="plotly_white", height=400,
+                                yaxis_title=t("kwh", lang))
+            st.plotly_chart(fig_m, use_container_width=True)
+        else:
+            st.info(t("click_to_run", lang))
+    else:
+        st.info(t("click_to_run", lang))
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 4: Weather
+# ══════════════════════════════════════════════════════════════════════════
 
 with tab_weather:
-    st.subheader("Przykładowy model pogody")
-    st.caption("Jeden losowy rok dla wybranej lokalizacji")
-
-    if st.button("Generuj pogodę", key="gen_weather"):
+    st.subheader(t("weather_header", lang))
+    st.caption(t("weather_hint", lang))
+    if st.button(t("generate_weather", lang), key="gen_weather"):
         rng = np.random.default_rng(42)
-        weather = __import__("simulator.weather", fromlist=["generate_year_weather"]).generate_year_weather(
-            location.latitude, location.longitude, rng,
-        )
+        weather = generate_year_weather(location.latitude, location.longitude, rng)
+        dt = weather.temperature_c.reshape(365, 24)
+        daily_avg, daily_max, daily_min = dt.mean(1), dt.max(1), dt.min(1)
+        fig_t = go.Figure()
+        fig_t.add_trace(go.Scatter(x=list(range(365)), y=daily_max, mode="lines",
+                                   line=dict(width=0), showlegend=False))
+        fig_t.add_trace(go.Scatter(x=list(range(365)), y=daily_min, mode="lines",
+                                   line=dict(width=0), fill="tonexty", fillcolor="rgba(255,107,53,0.2)",
+                                   name=t("daily_range", lang)))
+        fig_t.add_trace(go.Scatter(x=list(range(365)), y=daily_avg, mode="lines",
+                                   line=dict(color="#FF6B35"), name=t("daily_avg", lang)))
+        fig_t.update_layout(title=t("temperature", lang), xaxis_title=t("day_of_year", lang),
+                            yaxis_title="\u00b0C", template="plotly_white", height=300)
+        st.plotly_chart(fig_t, use_container_width=True)
 
-        hours = np.arange(8760)
-        days = hours / 24
+        daily_ghi = weather.ghi_w_m2.reshape(365, 24).sum(1) / 1000
+        fig_s = go.Figure(data=[go.Bar(x=list(range(365)), y=daily_ghi, marker_color="#FFC107")])
+        fig_s.update_layout(title=t("solar_irradiance", lang), xaxis_title=t("day_of_year", lang),
+                            yaxis_title=t("kwh_m2_day", lang), template="plotly_white", height=300)
+        st.plotly_chart(fig_s, use_container_width=True)
 
-        # Temperature
-        fig_temp = go.Figure()
-        # Daily averages for cleaner display
-        daily_temp = weather.temperature_c.reshape(365, 24).mean(axis=1)
-        daily_temp_max = weather.temperature_c.reshape(365, 24).max(axis=1)
-        daily_temp_min = weather.temperature_c.reshape(365, 24).min(axis=1)
+        ml = t("months", lang)
+        dim = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        mt, ms = [], []
+        s = 0
+        for d in dim:
+            e = s + d * 24
+            mt.append(weather.temperature_c[s:e].mean())
+            ms.append(weather.ghi_w_m2[s:e].sum() / 1000)
+            s = e
+        fig_mm = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_mm.add_trace(go.Bar(x=ml, y=ms, name=t("solar_monthly", lang), marker_color="#FFC107"), secondary_y=False)
+        fig_mm.add_trace(go.Scatter(x=ml, y=mt, name=t("avg_temp", lang),
+                                    line=dict(color="#E53935", width=3)), secondary_y=True)
+        fig_mm.update_layout(title=t("monthly_summary", lang), template="plotly_white", height=350)
+        fig_mm.update_yaxes(title_text="kWh/m\u00b2", secondary_y=False)
+        fig_mm.update_yaxes(title_text="\u00b0C", secondary_y=True)
+        st.plotly_chart(fig_mm, use_container_width=True)
 
-        fig_temp.add_trace(go.Scatter(
-            x=list(range(365)), y=daily_temp_max,
-            mode="lines", line=dict(width=0), showlegend=False,
-        ))
-        fig_temp.add_trace(go.Scatter(
-            x=list(range(365)), y=daily_temp_min,
-            mode="lines", line=dict(width=0),
-            fill="tonexty", fillcolor="rgba(255,107,53,0.2)",
-            name="Zakres min-max",
-        ))
-        fig_temp.add_trace(go.Scatter(
-            x=list(range(365)), y=daily_temp,
-            mode="lines", line=dict(color="#FF6B35"),
-            name="Średnia dzienna",
-        ))
-        fig_temp.update_layout(
-            title="Temperatura", xaxis_title="Dzień roku",
-            yaxis_title="°C", template="plotly_white", height=300,
-        )
-        st.plotly_chart(fig_temp, use_container_width=True)
-
-        # Solar irradiance
-        daily_ghi = weather.ghi_w_m2.reshape(365, 24).sum(axis=1) / 1000  # kWh/m²/day
-        fig_solar = go.Figure()
-        fig_solar.add_trace(go.Bar(
-            x=list(range(365)), y=daily_ghi,
-            marker_color="#FFC107", name="GHI",
-        ))
-        fig_solar.update_layout(
-            title="Nasłonecznienie (GHI)",
-            xaxis_title="Dzień roku",
-            yaxis_title="kWh/m²/dzień",
-            template="plotly_white", height=300,
-        )
-        st.plotly_chart(fig_solar, use_container_width=True)
-
-        # Monthly summary
-        months_pl = ["Sty", "Lut", "Mar", "Kwi", "Maj", "Cze",
-                     "Lip", "Sie", "Wrz", "Paź", "Lis", "Gru"]
-        days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        monthly_temp = []
-        monthly_solar = []
-        start = 0
-        for d in days_in_month:
-            end = start + d * 24
-            monthly_temp.append(weather.temperature_c[start:end].mean())
-            monthly_solar.append(weather.ghi_w_m2[start:end].sum() / 1000)
-            start = end
-
-        fig_monthly = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_monthly.add_trace(go.Bar(
-            x=months_pl, y=monthly_solar, name="Nasłonecznienie (kWh/m²)",
-            marker_color="#FFC107",
-        ), secondary_y=False)
-        fig_monthly.add_trace(go.Scatter(
-            x=months_pl, y=monthly_temp, name="Średnia temp. (°C)",
-            line=dict(color="#E53935", width=3),
-        ), secondary_y=True)
-        fig_monthly.update_layout(
-            title="Podsumowanie miesięczne", template="plotly_white", height=350,
-        )
-        fig_monthly.update_yaxes(title_text="kWh/m²", secondary_y=False)
-        fig_monthly.update_yaxes(title_text="°C", secondary_y=True)
-        st.plotly_chart(fig_monthly, use_container_width=True)
-
-
-# ── Technical details tab ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 5: Technical Details
+# ══════════════════════════════════════════════════════════════════════════
 
 with tab_details:
-    st.subheader("Szczegóły techniczne symulacji")
-
-    st.markdown("""
-    ### Metodologia
-
-    **Symulacja Monte Carlo** generuje wiele scenariuszy pogodowych dla wybranej
-    lokalizacji i oblicza bilans energetyczny godzina po godzinie przez zadany okres.
-
-    #### Model pogody
-    - Bazuje na profilach klimatycznych dla polskich miast
-    - Uwzględnia: temperaturę, nasłonecznienie (GHI), zachmurzenie, wiatr
-    - Każda symulacja generuje unikalny rok z wariacją względem średniej
-    - Modelowane są wielodniowe wzorce pogodowe (ciągi pochmurnych/słonecznych dni)
-
-    #### Model domu
-    - Straty ciepła przez przegrody: ściany, okna, dach, podłoga
-    - Straty wentylacyjne (infiltracja + wentylacja mechaniczna)
-    - Zyski solarne przez okna (uproszczone)
-    - Masa termiczna budynku wpływa na bezwładność cieplną
-
-    #### Fotowoltaika
-    - Model nachylonej powierzchni (izotropowy model promieniowania rozproszonego)
-    - Uwzględnia kąt nachylenia i azymut
-    - Straty systemowe (inwerter, kable, zabrudzenie): ~14%
-    - Degradacja paneli: 0.5%/rok
-
-    #### Bilans energetyczny (godzinowy)
-    1. Oblicz zapotrzebowanie: ogrzewanie/chłodzenie + CWU + urządzenia
-    2. Oblicz produkcję PV
-    3. Nadwyżka PV → magazyn → eksport do sieci
-    4. Deficyt → magazyn → import z sieci
-    5. Koszty według taryfy (opcjonalnie dwustrefowej)
-
-    #### Pompa ciepła
-    - COP interpolowany na podstawie temperatury zewnętrznej
-    - Punkty: COP przy +7°C, -7°C, -15°C
-    - Poniżej -20°C: rezerwowe ogrzewanie elektryczne
-
-    #### Ograniczenia modelu
-    - Uproszczony model termiczny budynku (quasi-stacjonarny)
-    - Brak modelowania zacienienia między budynkami
-    - Profil zużycia urządzeń statyczny (nie zmienia się sezonowo)
-    - Ceny energii rosną liniowo (brak skoków)
-    """)
+    st.subheader(t("technical_details", lang))
+    st.markdown(t("methodology", lang))
