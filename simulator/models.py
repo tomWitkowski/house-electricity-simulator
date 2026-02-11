@@ -268,7 +268,7 @@ class TariffParams:
 class SimulationParams:
     """Simulation parameters."""
     years: int = 10
-    num_simulations: int = 10  # default 10 for reasonable speed
+    num_simulations: int = 3  # 1 per scenario (cold/normal/warm)
     random_seed: Optional[int] = None
 
 

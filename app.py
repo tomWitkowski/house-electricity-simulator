@@ -54,8 +54,7 @@ with st.sidebar:
                 st.success(t("settings_imported", lang))
             except Exception:
                 st.error(t("settings_import_error", lang))
-        if st.button(t("export_settings", lang), key="btn_export"):
-            st.session_state["do_export"] = True
+        st.session_state["_export_placeholder"] = True  # placeholder for export button below
 
     # ── Location ──
     with st.expander(t("location", lang), expanded=True):
@@ -217,7 +216,7 @@ with st.sidebar:
     # ── Simulation ──
     with st.expander(t("sim_params", lang)):
         sim_years = st.slider(t("sim_years", lang), 1, 30, 10)
-        sim_n = st.slider(t("sim_runs", lang), 3, 300, 9, 3,
+        sim_n = st.slider(t("sim_runs", lang), 3, 300, 3, 3,
                           help="3 scenarios (cold/normal/warm) x N repeats")
         sim_seed = st.number_input(t("sim_seed", lang), 0, 99999, 0)
         sim_params = SimulationParams(years=sim_years, num_simulations=sim_n,
@@ -232,13 +231,15 @@ if recuperator.enabled: total_inv += recuperator.cost_total
 if ac_params.enabled: total_inv += ac_params.total_cost
 if floor_heating.enabled: total_inv += floor_heating.total_cost
 
-# Handle export
-if st.session_state.get("do_export"):
-    export_data = params_to_dict(location, house, pv_params, battery, heat_pump,
-                                 recuperator, ac_params, floor_heating, appliances, tariff, sim_params)
-    st.session_state["do_export"] = False
-    st.sidebar.download_button("Download JSON", json.dumps(export_data, indent=2, ensure_ascii=False),
-                               "energy_sim_settings.json", "application/json")
+# Handle export - always show download button in sidebar
+export_data = params_to_dict(location, house, pv_params, battery, heat_pump,
+                             recuperator, ac_params, floor_heating, appliances, tariff, sim_params)
+export_json = json.dumps(export_data, indent=2, ensure_ascii=False)
+st.sidebar.download_button(
+    t("export_settings", lang), export_json,
+    "energy_sim_settings.json", "application/json",
+    key="btn_export",
+)
 
 # ── Title ──
 st.title(t("app_title", lang))
@@ -253,25 +254,178 @@ tab_map, tab_results, tab_energy, tab_weather, tab_details = st.tabs([
 # TAB 1: Map
 # ══════════════════════════════════════════════════════════════════════════
 
-def _house_polygon(lat, lon, azimuth_deg, size_m=40):
-    w, d, peak = size_m / 2, size_m / 2, size_m * 0.35
-    pts = [(-w, -d), (w, -d), (w, d), (0, d + peak), (-w, d)]
+def _transform_pts(pts, lat, lon, azimuth_deg):
+    """Rotate points by azimuth and convert to lat/lon."""
     a = math.radians(azimuth_deg - 180)
     ca, sa = math.cos(a), math.sin(a)
-    mlat, mlon = 111320.0, 111320.0 * math.cos(math.radians(lat))
-    coords = [[lat + (x * sa + y * ca) / mlat, lon + (x * ca - y * sa) / mlon] for x, y in pts]
-    coords.append(coords[0])
-    return coords
+    mlat = 111320.0
+    mlon = 111320.0 * math.cos(math.radians(lat))
+    return [[lat + (x * sa + y * ca) / mlat, lon + (x * ca - y * sa) / mlon] for x, y in pts]
 
-def _pv_polygon(lat, lon, azimuth_deg, size_m=40):
-    w, d, peak = size_m / 2 * 0.8, size_m / 2, size_m * 0.35
-    pts = [(-w * 0.9, d * 0.3), (w * 0.9, d * 0.3), (0, d + peak * 0.85)]
-    a = math.radians(azimuth_deg - 180)
-    ca, sa = math.cos(a), math.sin(a)
-    mlat, mlon = 111320.0, 111320.0 * math.cos(math.radians(lat))
-    coords = [[lat + (x * sa + y * ca) / mlat, lon + (x * ca - y * sa) / mlon] for x, y in pts]
-    coords.append(coords[0])
-    return coords
+def _draw_house(m, lat, lon, house_params, pv_params, azimuth_deg):
+    """Draw a detailed house visualization on the folium map."""
+    # Scale house size based on actual area; floors affect proportions
+    floor_area = house_params.area_m2 / house_params.floors
+    side = floor_area ** 0.5  # approx side length in meters
+    scale = max(1.0, side / 10.0) * 3.5  # map scale factor
+    w = side / 2.0 * scale  # half-width
+    d = side / 2.0 * scale  # half-depth
+
+    # Wall thickness visual (proportional to insulation cm, exaggerated for visibility)
+    wall_t = house_params.wall_insulation_cm / 20.0 * scale * 0.12
+
+    # Roof peak height depends on roof tilt (higher tilt = taller peak)
+    roof_tilt = pv_params.roof_tilt_deg if pv_params.enabled else 30.0
+    peak_h = d * 0.3 * (roof_tilt / 35.0)  # normalize around 35deg
+    peak_h = max(d * 0.1, min(d * 0.55, peak_h))  # clamp
+
+    # ── Outer walls (filled) ──
+    outer = [(-w - wall_t, -d - wall_t), (w + wall_t, -d - wall_t),
+             (w + wall_t, d + wall_t), (-w - wall_t, d + wall_t)]
+    outer_coords = _transform_pts(outer, lat, lon, azimuth_deg)
+    outer_coords.append(outer_coords[0])
+    floor_label = f"{house_params.floors}F" if house_params.floors > 1 else "1F"
+    folium.Polygon(
+        locations=outer_coords, color="#37474F", fill=True,
+        fill_color="#546E7A", fill_opacity=0.5, weight=2,
+        tooltip=f"{floor_label} | {house_params.wall_insulation_cm}cm insul."
+    ).add_to(m)
+
+    # ── Inner floor (lighter fill to show wall thickness) ──
+    inner = [(-w, -d), (w, -d), (w, d), (-w, d)]
+    inner_coords = _transform_pts(inner, lat, lon, azimuth_deg)
+    inner_coords.append(inner_coords[0])
+    # Color by number of floors
+    floor_colors = {1: "#BBDEFB", 2: "#90CAF9", 3: "#64B5F6"}
+    fill_c = floor_colors.get(house_params.floors, "#64B5F6")
+    folium.Polygon(
+        locations=inner_coords, color="#5C6BC0", fill=True,
+        fill_color=fill_c, fill_opacity=0.65, weight=1,
+        tooltip=f"{house_params.area_m2}m\u00b2 | {house_params.floors} floor(s)"
+    ).add_to(m)
+
+    # ── Floor divider lines for multi-storey ──
+    if house_params.floors >= 2:
+        for fi in range(1, house_params.floors):
+            frac = fi / house_params.floors
+            y_line = -d + 2 * d * frac
+            line_pts = _transform_pts([(-w * 0.9, y_line), (w * 0.9, y_line)], lat, lon, azimuth_deg)
+            folium.PolyLine(line_pts, color="#78909C", weight=1, dash_array="4").add_to(m)
+
+    # ── Roof outline (triangle/gable) ──
+    roof_left = [(-w, d), (0, d + peak_h)]
+    roof_right = [(w, d), (0, d + peak_h)]
+    roof_ridge = [(-w, d), (w, d)]
+    for seg in [roof_left, roof_right, roof_ridge]:
+        folium.PolyLine(_transform_pts(seg, lat, lon, azimuth_deg),
+                        color="#8D6E63", weight=3, tooltip=f"Roof tilt: {roof_tilt:.0f}\u00b0").add_to(m)
+    # Roof fill
+    roof_poly = [(-w, d), (w, d), (0, d + peak_h)]
+    roof_coords = _transform_pts(roof_poly, lat, lon, azimuth_deg)
+    roof_coords.append(roof_coords[0])
+    folium.Polygon(
+        locations=roof_coords, color="#8D6E63", fill=True,
+        fill_color="#A1887F", fill_opacity=0.45, weight=2,
+        tooltip=f"Roof tilt: {roof_tilt:.0f}\u00b0"
+    ).add_to(m)
+
+    # ── PV modules on roof ──
+    if pv_params.enabled:
+        # Approximate number of panels (each ~1.7m2, ~0.4kWp)
+        panel_kwp = 0.4
+        n_panels = max(1, int(round(pv_params.peak_power_kw / panel_kwp)))
+        # Arrange panels in grid on the south-facing roof slope
+        cols = min(n_panels, max(2, int(w * 2 / (scale * 1.0))))
+        rows = max(1, math.ceil(n_panels / cols))
+        panel_w = (w * 2 * 0.85) / cols
+        panel_h = (peak_h * 0.75) / max(rows, 1)
+        panels_drawn = 0
+        for row in range(rows):
+            for col in range(cols):
+                if panels_drawn >= n_panels:
+                    break
+                px = -w * 0.85 + col * panel_w + panel_w * 0.05
+                py = d + peak_h * 0.12 + row * panel_h + panel_h * 0.05
+                p_pts = [(px, py), (px + panel_w * 0.9, py),
+                         (px + panel_w * 0.9, py + panel_h * 0.85),
+                         (px, py + panel_h * 0.85)]
+                p_coords = _transform_pts(p_pts, lat, lon, azimuth_deg)
+                p_coords.append(p_coords[0])
+                folium.Polygon(
+                    locations=p_coords, color="#1565C0", fill=True,
+                    fill_color="#1E88E5", fill_opacity=0.8, weight=1,
+                    tooltip=f"PV panel ({panels_drawn+1}/{n_panels})"
+                ).add_to(m)
+                panels_drawn += 1
+
+        # Ground-mount PV array (if enabled)
+        if pv_params.ground_mount_enabled and pv_params.ground_mount_kwp > 0:
+            n_ground = max(1, int(round(pv_params.ground_mount_kwp / panel_kwp)))
+            g_cols = min(n_ground, 6)
+            g_rows = max(1, math.ceil(n_ground / g_cols))
+            gw = panel_w * 0.8
+            gh = panel_h * 0.7
+            gx_start = -g_cols * gw / 2
+            gy_start = -d - wall_t - scale * 3  # below the house
+            drawn = 0
+            for gr in range(g_rows):
+                for gc in range(g_cols):
+                    if drawn >= n_ground:
+                        break
+                    gx = gx_start + gc * gw + gw * 0.05
+                    gy = gy_start - gr * gh - gh * 0.05
+                    gp = [(gx, gy), (gx + gw * 0.9, gy),
+                          (gx + gw * 0.9, gy + gh * 0.85), (gx, gy + gh * 0.85)]
+                    gp_coords = _transform_pts(gp, lat, lon, azimuth_deg)
+                    gp_coords.append(gp_coords[0])
+                    folium.Polygon(
+                        locations=gp_coords, color="#2E7D32", fill=True,
+                        fill_color="#43A047", fill_opacity=0.75, weight=1,
+                        tooltip=f"Ground PV ({drawn+1}/{n_ground})"
+                    ).add_to(m)
+                    drawn += 1
+
+    # ── Windows (small rectangles on walls) ──
+    n_windows = max(2, int(house_params.window_area_ratio * 20))
+    window_positions = []
+    # Front wall windows
+    for i in range(min(n_windows // 2, 4)):
+        wx = -w * 0.7 + i * (w * 1.4 / max(1, min(n_windows // 2, 4)))
+        window_positions.append(("front", wx, -d))
+    # Back wall windows
+    for i in range(min(n_windows - n_windows // 2, 4)):
+        wx = -w * 0.7 + i * (w * 1.4 / max(1, min(n_windows - n_windows // 2, 4)))
+        window_positions.append(("back", wx, d))
+
+    win_w = w * 0.18
+    win_h = wall_t * 1.5
+    for side, wx, wy in window_positions:
+        if side == "front":
+            wp = [(wx, wy - win_h), (wx + win_w, wy - win_h),
+                  (wx + win_w, wy), (wx, wy)]
+        else:
+            wp = [(wx, wy), (wx + win_w, wy),
+                  (wx + win_w, wy + win_h), (wx, wy + win_h)]
+        wc = _transform_pts(wp, lat, lon, azimuth_deg)
+        wc.append(wc[0])
+        folium.Polygon(
+            locations=wc, color="#B3E5FC", fill=True,
+            fill_color="#E1F5FE", fill_opacity=0.8, weight=1,
+            tooltip=f"Window (U={house_params.window_u_value})"
+        ).add_to(m)
+
+    # ── Door ──
+    door_w = w * 0.12
+    door_h = wall_t * 2
+    door_pts = [(-door_w / 2, -d - door_h), (door_w / 2, -d - door_h),
+                (door_w / 2, -d), (-door_w / 2, -d)]
+    door_coords = _transform_pts(door_pts, lat, lon, azimuth_deg)
+    door_coords.append(door_coords[0])
+    folium.Polygon(
+        locations=door_coords, color="#5D4037", fill=True,
+        fill_color="#795548", fill_opacity=0.85, weight=1
+    ).add_to(m)
+
 
 with tab_map:
     st.subheader(t("map_header", lang))
@@ -279,19 +433,16 @@ with tab_map:
     map_col, info_col = st.columns([3, 2])
 
     with map_col:
-        m = folium.Map(location=[lat, lon], zoom_start=17, tiles="OpenStreetMap")
+        m = folium.Map(location=[lat, lon], zoom_start=18, tiles="OpenStreetMap")
         azimuth = pv_azimuth if pv_enabled else 180
-        folium.Polygon(locations=_house_polygon(lat, lon, azimuth), color="#5C6BC0",
-                       fill=True, fill_color="#7986CB", fill_opacity=0.6, weight=2,
-                       tooltip=f"{t('house', lang)}: {house.area_m2}m\u00b2").add_to(m)
-        if pv_enabled:
-            folium.Polygon(locations=_pv_polygon(lat, lon, azimuth), color="#F57F17",
-                           fill=True, fill_color="#FFD54F", fill_opacity=0.7, weight=2,
-                           tooltip=f"PV: {pv_params.total_kwp:.1f} kWp").add_to(m)
+
+        _draw_house(m, lat, lon, house, pv_params, azimuth)
+
         # Direction arrow
-        mlat, mlon = 111320.0, 111320.0 * math.cos(math.radians(lat))
-        ae_lat = lat + 60 * math.cos(math.radians(180 - azimuth)) / mlat
-        ae_lon = lon + 60 * math.sin(math.radians(azimuth - 180)) / mlon
+        mlat_c, mlon_c = 111320.0, 111320.0 * math.cos(math.radians(lat))
+        arrow_len = max(30, (house.area_m2 / house.floors) ** 0.5 * 5)
+        ae_lat = lat + arrow_len * math.cos(math.radians(180 - azimuth)) / mlat_c
+        ae_lon = lon + arrow_len * math.sin(math.radians(azimuth - 180)) / mlon_c
         dir_labels = {0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW"}
         dir_label = dir_labels[min(dir_labels, key=lambda d: abs(d - azimuth))]
         folium.PolyLine([[lat, lon], [ae_lat, ae_lon]], color="#E53935", weight=3, dash_array="8",
@@ -299,7 +450,17 @@ with tab_map:
         folium.Marker([ae_lat, ae_lon], icon=folium.DivIcon(
             html=f'<div style="font-size:14px;font-weight:bold;color:#E53935">{dir_label}</div>',
             icon_size=(30, 20), icon_anchor=(15, 10))).add_to(m)
-        map_data = st_folium(m, width=None, height=500, returned_objects=["last_clicked"])
+
+        # Draggable marker to reposition house
+        folium.Marker(
+            [lat, lon],
+            icon=folium.Icon(color="blue", icon="home", prefix="fa"),
+            draggable=True,
+            tooltip=t("map_hint", lang),
+        ).add_to(m)
+
+        map_data = st_folium(m, width=None, height=500,
+                             returned_objects=["last_object_clicked_tooltip", "last_clicked"])
         if map_data and map_data.get("last_clicked"):
             c = map_data["last_clicked"]
             nl, no = round(c["lat"], 4), round(c["lng"], 4)
