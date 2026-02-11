@@ -61,8 +61,12 @@ class SimulationResult:
 
 
 def _pv_output_on_surface(ghi, panel_tilt_deg, panel_azimuth_deg,
-                          solar_elevation_deg, day_of_year, latitude):
-    """Approximate irradiance on tilted surface from GHI."""
+                          solar_elevation_deg, day_of_year, latitude, hour):
+    """Approximate irradiance on tilted surface from GHI.
+
+    Includes panel azimuth vs sun azimuth correction for accurate
+    east/west facing panel output.
+    """
     if ghi <= 0 or solar_elevation_deg <= 0:
         return 0.0
 
@@ -73,8 +77,12 @@ def _pv_output_on_surface(ghi, panel_tilt_deg, panel_azimuth_deg,
     tilt_r = np.radians(panel_tilt_deg)
     elev_r = np.radians(solar_elevation_deg)
 
+    # Sun azimuth (approximate)
+    sun_az = _sun_azimuth(latitude, day_of_year, hour, solar_elevation_deg)
+    az_diff_r = np.radians(sun_az - panel_azimuth_deg)
+
     cos_incidence = (np.sin(elev_r) * np.cos(tilt_r) +
-                     np.cos(elev_r) * np.sin(tilt_r))
+                     np.cos(elev_r) * np.sin(tilt_r) * np.cos(az_diff_r))
     cos_incidence = max(0, cos_incidence)
 
     if np.sin(elev_r) > 0.01:
@@ -96,6 +104,25 @@ def _solar_elevation_approx(latitude, day_of_year, hour):
     sin_elev = (np.sin(lat_r) * np.sin(dec_r) +
                 np.cos(lat_r) * np.cos(dec_r) * np.cos(ha_r))
     return np.degrees(np.arcsin(np.clip(sin_elev, -1, 1)))
+
+
+def _sun_azimuth(latitude, day_of_year, hour, solar_elevation_deg):
+    """Approximate sun azimuth in degrees (0=N, 90=E, 180=S, 270=W)."""
+    if solar_elevation_deg <= 0:
+        return 180.0
+    declination = 23.45 * np.sin(np.radians(360 / 365 * (day_of_year - 81)))
+    lat_r = np.radians(latitude)
+    dec_r = np.radians(declination)
+    elev_r = np.radians(solar_elevation_deg)
+    # cos(azimuth) from south
+    cos_az = (np.sin(dec_r) - np.sin(lat_r) * np.sin(elev_r)) / \
+             max(0.001, np.cos(lat_r) * np.cos(elev_r))
+    cos_az = np.clip(cos_az, -1, 1)
+    azimuth = np.degrees(np.arccos(cos_az))
+    # Afternoon: azimuth > 180 (west)
+    if hour > 12:
+        azimuth = 360 - azimuth
+    return azimuth
 
 
 def _appliance_hourly_factor(hour):
@@ -317,7 +344,7 @@ def _simulate_year(
             if solar_elev > 0:
                 irr_tilted = _pv_output_on_surface(
                     ghi, pv.roof_tilt_deg, pv.roof_azimuth_deg,
-                    solar_elev, day_of_year, location.latitude,
+                    solar_elev, day_of_year, location.latitude, hour_of_day,
                 )
                 pv_gen += (pv.peak_power_kw * (irr_tilted / 1000.0) *
                           (1 - pv.system_losses) * pv_degradation)
@@ -325,7 +352,7 @@ def _simulate_year(
                 if pv.ground_mount_enabled and pv.ground_mount_kwp > 0:
                     irr_ground = _pv_output_on_surface(
                         ghi, pv.ground_tilt_deg, pv.ground_azimuth_deg,
-                        solar_elev, day_of_year, location.latitude,
+                        solar_elev, day_of_year, location.latitude, hour_of_day,
                     )
                     pv_gen += (pv.ground_mount_kwp * (irr_ground / 1000.0) *
                               (1 - pv.system_losses) * pv_degradation)

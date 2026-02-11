@@ -283,6 +283,17 @@ location and calculates the energy balance hour by hour over the given period.
         "heating_thermal_label": "Heating demand (thermal)",
         "net_cost_label": "Net cost",
 
+        # Savings & battery
+        "savings_breakdown": "Savings Breakdown by Component",
+        "savings_per_year": "Savings/year",
+        "payback_years": "Payback (years)",
+        "investment_cost_10y": "Investment / 10 (annual equiv.)",
+        "battery_analysis": "Battery Storage Analysis",
+        "battery_cycles_year": "Cycles/year",
+        "battery_throughput": "Throughput/year",
+        "battery_profit_year": "Arbitrage profit/year",
+        "battery_payback": "Battery payback",
+
         # Months
         "months": ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
@@ -548,6 +559,16 @@ lokalizacji i oblicza bilans energetyczny godzina po godzinie przez zadany okres
         "grid_import_label": "Pobór z sieci",
         "heating_thermal_label": "Zapotrzebowanie na ciepło",
         "net_cost_label": "Koszt netto",
+
+        "savings_breakdown": "Oszczędności na poszczególnych komponentach",
+        "savings_per_year": "Oszczędności/rok",
+        "payback_years": "Zwrot (lata)",
+        "investment_cost_10y": "Inwestycja / 10 (roczny ekw.)",
+        "battery_analysis": "Analiza magazynu energii",
+        "battery_cycles_year": "Cykle/rok",
+        "battery_throughput": "Przepustowość/rok",
+        "battery_profit_year": "Zysk z arbitrażu/rok",
+        "battery_payback": "Zwrot magazynu",
 
         "months": ["Sty", "Lut", "Mar", "Kwi", "Maj", "Cze",
                     "Lip", "Sie", "Wrz", "Paź", "Lis", "Gru"],

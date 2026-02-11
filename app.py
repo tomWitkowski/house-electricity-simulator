@@ -33,6 +33,12 @@ CITY_COORDS = {
     "Wroclaw": (51.1, 17.0), "Warszawa": (52.23, 21.0),
     "Krakow": (50.06, 19.94), "Gdansk": (54.35, 18.65),
     "Poznan": (52.41, 16.93), "Szczecin": (53.43, 14.55),
+    "Stockholm": (59.33, 18.07), "Oslo": (59.91, 10.75),
+    "Helsinki": (60.17, 24.94), "Berlin": (52.52, 13.41),
+    "London": (51.51, -0.13), "Paris": (48.86, 2.35),
+    "Madrid": (40.42, -3.70), "Rome": (41.90, 12.50),
+    "Vienna": (48.21, 16.37), "Munich": (48.14, 11.58),
+    "Athens": (37.98, 23.73),
 }
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -61,9 +67,9 @@ with st.sidebar:
         city_options = list(CITY_COORDS.keys()) + [t("other", lang)]
         city = st.selectbox(t("city", lang), city_options, index=0)
         if city == t("other", lang):
-            lat = st.number_input(t("latitude", lang), 49.0, 55.0,
+            lat = st.number_input(t("latitude", lang), 35.0, 71.0,
                                   st.session_state.get("map_lat", 51.1), 0.1)
-            lon = st.number_input(t("longitude", lang), 14.0, 24.0,
+            lon = st.number_input(t("longitude", lang), -10.0, 40.0,
                                   st.session_state.get("map_lon", 17.0), 0.1)
         else:
             lat, lon = CITY_COORDS[city]
@@ -254,213 +260,149 @@ tab_map, tab_results, tab_energy, tab_weather, tab_details = st.tabs([
 # TAB 1: Map
 # ══════════════════════════════════════════════════════════════════════════
 
-def _transform_pts(pts, lat, lon, azimuth_deg):
-    """Rotate points by azimuth and convert to lat/lon."""
-    a = math.radians(azimuth_deg - 180)
-    ca, sa = math.cos(a), math.sin(a)
-    mlat = 111320.0
-    mlon = 111320.0 * math.cos(math.radians(lat))
-    return [[lat + (x * sa + y * ca) / mlat, lon + (x * ca - y * sa) / mlon] for x, y in pts]
-
-def _draw_house(m, lat, lon, house_params, pv_params, azimuth_deg):
-    """Draw a detailed house visualization on the folium map."""
-    # Scale house size based on actual area; floors affect proportions
+def _build_house_figure(house_params, pv_params, azimuth_deg, lang):
+    """Build a Plotly figure showing the house cross-section."""
     floor_area = house_params.area_m2 / house_params.floors
-    side = floor_area ** 0.5  # approx side length in meters
-    scale = max(1.0, side / 10.0) * 3.5  # map scale factor
-    w = side / 2.0 * scale  # half-width
-    d = side / 2.0 * scale  # half-depth
+    side = floor_area ** 0.5
+    w = side / 2.0
+    floor_h = house_params.ceiling_height_m
 
-    # Wall thickness visual (proportional to insulation cm, exaggerated for visibility)
-    wall_t = house_params.wall_insulation_cm / 20.0 * scale * 0.12
+    # Wall thickness in meters (scaled for visibility)
+    wall_t = house_params.wall_insulation_cm / 100.0
+    wall_t_vis = max(0.15, wall_t * 1.5)  # exaggerate for visibility
 
-    # Roof peak height depends on roof tilt (higher tilt = taller peak)
     roof_tilt = pv_params.roof_tilt_deg if pv_params.enabled else 30.0
-    peak_h = d * 0.3 * (roof_tilt / 35.0)  # normalize around 35deg
-    peak_h = max(d * 0.1, min(d * 0.55, peak_h))  # clamp
+    peak_h = w * math.tan(math.radians(roof_tilt))
+    total_h = house_params.floors * floor_h
 
-    # ── Outer walls (filled) ──
-    outer = [(-w - wall_t, -d - wall_t), (w + wall_t, -d - wall_t),
-             (w + wall_t, d + wall_t), (-w - wall_t, d + wall_t)]
-    outer_coords = _transform_pts(outer, lat, lon, azimuth_deg)
-    outer_coords.append(outer_coords[0])
-    floor_label = f"{house_params.floors}F" if house_params.floors > 1 else "1F"
-    folium.Polygon(
-        locations=outer_coords, color="#37474F", fill=True,
-        fill_color="#546E7A", fill_opacity=0.5, weight=2,
-        tooltip=f"{floor_label} | {house_params.wall_insulation_cm}cm insul."
-    ).add_to(m)
+    fig = go.Figure()
 
-    # ── Inner floor (lighter fill to show wall thickness) ──
-    inner = [(-w, -d), (w, -d), (w, d), (-w, d)]
-    inner_coords = _transform_pts(inner, lat, lon, azimuth_deg)
-    inner_coords.append(inner_coords[0])
-    # Color by number of floors
-    floor_colors = {1: "#BBDEFB", 2: "#90CAF9", 3: "#64B5F6"}
-    fill_c = floor_colors.get(house_params.floors, "#64B5F6")
-    folium.Polygon(
-        locations=inner_coords, color="#5C6BC0", fill=True,
-        fill_color=fill_c, fill_opacity=0.65, weight=1,
-        tooltip=f"{house_params.area_m2}m\u00b2 | {house_params.floors} floor(s)"
-    ).add_to(m)
+    # Ground
+    fig.add_shape(type="rect", x0=-w - 2, y0=-0.3, x1=w + 2, y1=0,
+                  fillcolor="#8D6E63", line=dict(width=0))
 
-    # ── Floor divider lines for multi-storey ──
-    if house_params.floors >= 2:
-        for fi in range(1, house_params.floors):
-            frac = fi / house_params.floors
-            y_line = -d + 2 * d * frac
-            line_pts = _transform_pts([(-w * 0.9, y_line), (w * 0.9, y_line)], lat, lon, azimuth_deg)
-            folium.PolyLine(line_pts, color="#78909C", weight=1, dash_array="4").add_to(m)
+    # Outer walls
+    fig.add_shape(type="rect", x0=-w - wall_t_vis, y0=0, x1=w + wall_t_vis, y1=total_h,
+                  fillcolor="#78909C", line=dict(color="#455A64", width=2))
+    # Inner space
+    fig.add_shape(type="rect", x0=-w, y0=0, x1=w, y1=total_h,
+                  fillcolor="#E3F2FD", line=dict(color="#90A4AE", width=1))
 
-    # ── Roof outline (triangle/gable) ──
-    roof_left = [(-w, d), (0, d + peak_h)]
-    roof_right = [(w, d), (0, d + peak_h)]
-    roof_ridge = [(-w, d), (w, d)]
-    for seg in [roof_left, roof_right, roof_ridge]:
-        folium.PolyLine(_transform_pts(seg, lat, lon, azimuth_deg),
-                        color="#8D6E63", weight=3, tooltip=f"Roof tilt: {roof_tilt:.0f}\u00b0").add_to(m)
-    # Roof fill
-    roof_poly = [(-w, d), (w, d), (0, d + peak_h)]
-    roof_coords = _transform_pts(roof_poly, lat, lon, azimuth_deg)
-    roof_coords.append(roof_coords[0])
-    folium.Polygon(
-        locations=roof_coords, color="#8D6E63", fill=True,
-        fill_color="#A1887F", fill_opacity=0.45, weight=2,
-        tooltip=f"Roof tilt: {roof_tilt:.0f}\u00b0"
-    ).add_to(m)
+    # Floor lines
+    for fi in range(1, house_params.floors):
+        y = fi * floor_h
+        fig.add_shape(type="line", x0=-w - wall_t_vis, y0=y, x1=w + wall_t_vis, y1=y,
+                      line=dict(color="#455A64", width=2))
+        fig.add_annotation(x=0, y=y + floor_h / 2,
+                           text=f"{t('floors_label', lang)} {fi + 1}",
+                           showarrow=False, font=dict(size=10, color="#546E7A"))
 
-    # ── PV modules on roof ──
+    if house_params.floors >= 1:
+        fig.add_annotation(x=0, y=floor_h / 2,
+                           text=f"{t('floors_label', lang)} 1",
+                           showarrow=False, font=dict(size=10, color="#546E7A"))
+
+    # Windows on front wall
+    n_win = max(1, min(4, int(house_params.window_area_ratio * 15)))
+    win_w = side * 0.12
+    win_h = floor_h * 0.4
+    for fi in range(house_params.floors):
+        y_base = fi * floor_h + floor_h * 0.3
+        for wi in range(n_win):
+            x_pos = -w * 0.7 + wi * (w * 1.4 / max(1, n_win))
+            fig.add_shape(type="rect", x0=x_pos, y0=y_base, x1=x_pos + win_w, y1=y_base + win_h,
+                          fillcolor="#B3E5FC", line=dict(color="#0288D1", width=1.5))
+
+    # Door
+    door_w = side * 0.1
+    door_h = min(floor_h * 0.7, 2.2)
+    fig.add_shape(type="rect", x0=-door_w / 2, y0=0, x1=door_w / 2, y1=door_h,
+                  fillcolor="#795548", line=dict(color="#4E342E", width=1.5))
+
+    # Roof
+    roof_x = [-w - wall_t_vis, 0, w + wall_t_vis, -w - wall_t_vis]
+    roof_y = [total_h, total_h + peak_h, total_h, total_h]
+    fig.add_trace(go.Scatter(x=roof_x, y=roof_y, fill="toself",
+                             fillcolor="#A1887F", line=dict(color="#6D4C41", width=2),
+                             mode="lines", name=f"Roof {roof_tilt:.0f}\u00b0",
+                             hoverinfo="name"))
+
+    # PV panels on roof
     if pv_params.enabled:
-        # Approximate number of panels (each ~1.7m2, ~0.4kWp)
-        panel_kwp = 0.4
-        n_panels = max(1, int(round(pv_params.peak_power_kw / panel_kwp)))
-        # Arrange panels in grid on the south-facing roof slope
-        cols = min(n_panels, max(2, int(w * 2 / (scale * 1.0))))
+        n_panels = max(1, int(round(pv_params.peak_power_kw / 0.4)))
+        # PV on left slope (south-facing side)
+        pv_x0 = -w * 0.85
+        pv_x1 = -w * 0.05
+        pv_y0 = total_h + peak_h * 0.1
+        pv_y1 = total_h + peak_h * 0.85
+        # Individual panels
+        cols = min(n_panels, max(2, int(w / 0.8)))
         rows = max(1, math.ceil(n_panels / cols))
-        panel_w = (w * 2 * 0.85) / cols
-        panel_h = (peak_h * 0.75) / max(rows, 1)
-        panels_drawn = 0
-        for row in range(rows):
-            for col in range(cols):
-                if panels_drawn >= n_panels:
+        pw = (pv_x1 - pv_x0) / cols
+        ph = (pv_y1 - pv_y0) / rows
+        drawn = 0
+        for r in range(rows):
+            for c in range(cols):
+                if drawn >= n_panels:
                     break
-                px = -w * 0.85 + col * panel_w + panel_w * 0.05
-                py = d + peak_h * 0.12 + row * panel_h + panel_h * 0.05
-                p_pts = [(px, py), (px + panel_w * 0.9, py),
-                         (px + panel_w * 0.9, py + panel_h * 0.85),
-                         (px, py + panel_h * 0.85)]
-                p_coords = _transform_pts(p_pts, lat, lon, azimuth_deg)
-                p_coords.append(p_coords[0])
-                folium.Polygon(
-                    locations=p_coords, color="#1565C0", fill=True,
-                    fill_color="#1E88E5", fill_opacity=0.8, weight=1,
-                    tooltip=f"PV panel ({panels_drawn+1}/{n_panels})"
-                ).add_to(m)
-                panels_drawn += 1
+                px0 = pv_x0 + c * pw + pw * 0.05
+                py0 = pv_y0 + r * ph + ph * 0.05
+                fig.add_shape(type="rect",
+                              x0=px0, y0=py0,
+                              x1=px0 + pw * 0.9, y1=py0 + ph * 0.9,
+                              fillcolor="#1565C0", line=dict(color="#0D47A1", width=1))
+                drawn += 1
 
-        # Ground-mount PV array (if enabled)
-        if pv_params.ground_mount_enabled and pv_params.ground_mount_kwp > 0:
-            n_ground = max(1, int(round(pv_params.ground_mount_kwp / panel_kwp)))
-            g_cols = min(n_ground, 6)
-            g_rows = max(1, math.ceil(n_ground / g_cols))
-            gw = panel_w * 0.8
-            gh = panel_h * 0.7
-            gx_start = -g_cols * gw / 2
-            gy_start = -d - wall_t - scale * 3  # below the house
-            drawn = 0
-            for gr in range(g_rows):
-                for gc in range(g_cols):
-                    if drawn >= n_ground:
-                        break
-                    gx = gx_start + gc * gw + gw * 0.05
-                    gy = gy_start - gr * gh - gh * 0.05
-                    gp = [(gx, gy), (gx + gw * 0.9, gy),
-                          (gx + gw * 0.9, gy + gh * 0.85), (gx, gy + gh * 0.85)]
-                    gp_coords = _transform_pts(gp, lat, lon, azimuth_deg)
-                    gp_coords.append(gp_coords[0])
-                    folium.Polygon(
-                        locations=gp_coords, color="#2E7D32", fill=True,
-                        fill_color="#43A047", fill_opacity=0.75, weight=1,
-                        tooltip=f"Ground PV ({drawn+1}/{n_ground})"
-                    ).add_to(m)
-                    drawn += 1
+        fig.add_annotation(x=(pv_x0 + pv_x1) / 2, y=(pv_y0 + pv_y1) / 2,
+                           text=f"PV {pv_params.peak_power_kw:.0f} kWp\n({n_panels} panels)",
+                           showarrow=False, font=dict(size=9, color="white"),
+                           bgcolor="rgba(21,101,192,0.6)", borderpad=3)
 
-    # ── Windows (small rectangles on walls) ──
-    n_windows = max(2, int(house_params.window_area_ratio * 20))
-    window_positions = []
-    # Front wall windows
-    for i in range(min(n_windows // 2, 4)):
-        wx = -w * 0.7 + i * (w * 1.4 / max(1, min(n_windows // 2, 4)))
-        window_positions.append(("front", wx, -d))
-    # Back wall windows
-    for i in range(min(n_windows - n_windows // 2, 4)):
-        wx = -w * 0.7 + i * (w * 1.4 / max(1, min(n_windows - n_windows // 2, 4)))
-        window_positions.append(("back", wx, d))
+    # Insulation label
+    fig.add_annotation(x=w + wall_t_vis / 2, y=total_h / 2,
+                       text=f"{house_params.wall_insulation_cm}cm",
+                       showarrow=True, ax=30, ay=0,
+                       font=dict(size=9, color="#455A64"))
 
-    win_w = w * 0.18
-    win_h = wall_t * 1.5
-    for side, wx, wy in window_positions:
-        if side == "front":
-            wp = [(wx, wy - win_h), (wx + win_w, wy - win_h),
-                  (wx + win_w, wy), (wx, wy)]
-        else:
-            wp = [(wx, wy), (wx + win_w, wy),
-                  (wx + win_w, wy + win_h), (wx, wy + win_h)]
-        wc = _transform_pts(wp, lat, lon, azimuth_deg)
-        wc.append(wc[0])
-        folium.Polygon(
-            locations=wc, color="#B3E5FC", fill=True,
-            fill_color="#E1F5FE", fill_opacity=0.8, weight=1,
-            tooltip=f"Window (U={house_params.window_u_value})"
-        ).add_to(m)
+    # Dimension labels
+    fig.add_annotation(x=0, y=-0.6, text=f"{side:.1f} m",
+                       showarrow=False, font=dict(size=10, color="#333"))
+    fig.add_annotation(x=w + 1.5, y=total_h / 2, text=f"{total_h:.1f} m",
+                       showarrow=False, font=dict(size=10, color="#333"), textangle=-90)
 
-    # ── Door ──
-    door_w = w * 0.12
-    door_h = wall_t * 2
-    door_pts = [(-door_w / 2, -d - door_h), (door_w / 2, -d - door_h),
-                (door_w / 2, -d), (-door_w / 2, -d)]
-    door_coords = _transform_pts(door_pts, lat, lon, azimuth_deg)
-    door_coords.append(door_coords[0])
-    folium.Polygon(
-        locations=door_coords, color="#5D4037", fill=True,
-        fill_color="#795548", fill_opacity=0.85, weight=1
-    ).add_to(m)
+    # Compass / azimuth indicator
+    dir_labels = {0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW"}
+    dir_label = dir_labels.get(min(dir_labels, key=lambda d: abs(d - azimuth_deg)), "")
+    fig.add_annotation(x=w + 1.5, y=total_h + peak_h,
+                       text=f"\u2191 {dir_label} ({azimuth_deg}\u00b0)",
+                       showarrow=False, font=dict(size=11, color="#E53935"))
+
+    fig.update_layout(
+        showlegend=False,
+        height=350,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(visible=False, scaleanchor="y", scaleratio=1,
+                   range=[-w - 3, w + 3]),
+        yaxis=dict(visible=False, range=[-1, total_h + peak_h + 1.5]),
+        plot_bgcolor="white",
+    )
+    return fig
 
 
 with tab_map:
     st.subheader(t("map_header", lang))
-    st.caption(t("map_hint", lang))
-    map_col, info_col = st.columns([3, 2])
+    map_col, house_col = st.columns([1, 1])
 
     with map_col:
-        m = folium.Map(location=[lat, lon], zoom_start=18, tiles="OpenStreetMap")
+        st.caption(t("map_hint", lang))
+        m = folium.Map(location=[lat, lon], zoom_start=13, tiles="OpenStreetMap")
         azimuth = pv_azimuth if pv_enabled else 180
-
-        _draw_house(m, lat, lon, house, pv_params, azimuth)
-
-        # Direction arrow
-        mlat_c, mlon_c = 111320.0, 111320.0 * math.cos(math.radians(lat))
-        arrow_len = max(30, (house.area_m2 / house.floors) ** 0.5 * 5)
-        ae_lat = lat + arrow_len * math.cos(math.radians(180 - azimuth)) / mlat_c
-        ae_lon = lon + arrow_len * math.sin(math.radians(azimuth - 180)) / mlon_c
-        dir_labels = {0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW"}
-        dir_label = dir_labels[min(dir_labels, key=lambda d: abs(d - azimuth))]
-        folium.PolyLine([[lat, lon], [ae_lat, ae_lon]], color="#E53935", weight=3, dash_array="8",
-                        tooltip=f"{t('roof_direction', lang)}: {azimuth}\u00b0 ({dir_label})").add_to(m)
-        folium.Marker([ae_lat, ae_lon], icon=folium.DivIcon(
-            html=f'<div style="font-size:14px;font-weight:bold;color:#E53935">{dir_label}</div>',
-            icon_size=(30, 20), icon_anchor=(15, 10))).add_to(m)
-
-        # Draggable marker to reposition house
         folium.Marker(
             [lat, lon],
             icon=folium.Icon(color="blue", icon="home", prefix="fa"),
-            draggable=True,
-            tooltip=t("map_hint", lang),
+            tooltip=f"{location.city_name} ({lat:.2f}, {lon:.2f})",
         ).add_to(m)
-
-        map_data = st_folium(m, width=None, height=500,
-                             returned_objects=["last_object_clicked_tooltip", "last_clicked"])
+        map_data = st_folium(m, width=None, height=420, returned_objects=["last_clicked"])
         if map_data and map_data.get("last_clicked"):
             c = map_data["last_clicked"]
             nl, no = round(c["lat"], 4), round(c["lng"], 4)
@@ -471,34 +413,24 @@ with tab_map:
                 st.rerun()
         st.caption(f"{t('current_location', lang)}: {lat:.4f}\u00b0N, {lon:.4f}\u00b0E")
 
-    with info_col:
-        st.markdown(f"**{t('house_label', lang)}**")
-        st.write(f"- {t('area_label', lang)}: {house.area_m2} m\u00b2 | {t('floors_label', lang)}: {house.floors}")
-        st.write(f"- {t('insulation_label', lang)}: {house.wall_insulation_cm} cm | {t('windows_label', lang)}: {house.window_u_value}")
-        st.write(f"- {t('heat_loss_label', lang)}: {house.envelope_loss_coefficient:.0f} W/K "
-                 f"(trans: {house.transmission_loss_coefficient:.0f}, vent: {house.ventilation_loss_coefficient:.0f}, "
-                 f"infil: {house.infiltration_loss_coefficient:.0f})")
+    with house_col:
+        fig_house = _build_house_figure(house, pv_params, azimuth, lang)
+        st.plotly_chart(fig_house, use_container_width=True)
 
-        st.markdown(f"**{t('energy_systems', lang)}**")
-        if pv_params.enabled: st.write(f"- PV: {pv_params.total_kwp:.1f} kWp ({azimuth}\u00b0)")
-        if battery.enabled: st.write(f"- {t('battery', lang)}: {battery.capacity_kwh} kWh")
-        if heat_pump.enabled: st.write(f"- {t('heat_pump', lang)}: {heat_pump.rated_power_kw} kW")
-        if recuperator.enabled: st.write(f"- {t('recuperator', lang)}: {recuperator.efficiency*100:.0f}%")
-        if ac_params.enabled: st.write(f"- {t('ac', lang)}: {ac_params.num_units}x {ac_params.cooling_capacity_kw} kW")
-        if floor_heating.enabled: st.write(f"- {t('floor_heating', lang)}: {floor_heating.area_m2} m\u00b2")
-
-        st.markdown(f"**{t('investment_costs', lang)}**")
-        for name, cost in [(t("pv_panels", lang), pv_params.total_cost)] * pv_params.enabled + \
-                          [(t("battery", lang), battery.cost_total)] * battery.enabled + \
-                          [(t("heat_pump", lang), heat_pump.cost_total)] * heat_pump.enabled + \
-                          [(t("recuperator", lang), recuperator.cost_total)] * recuperator.enabled + \
-                          [(t("ac", lang), ac_params.total_cost)] * ac_params.enabled + \
-                          [(t("floor_heating", lang), floor_heating.total_cost)] * floor_heating.enabled:
-            st.write(f"- {name}: {cost:,.0f} {CURRENCY}")
-        st.markdown(f"**{t('total', lang)}: {total_inv:,.0f} {CURRENCY}**")
-        st.divider()
-        st.write(f"**{t('base_consumption', lang)}:** {appliances.base_daily_kwh:.1f} kWh{t('per_day', lang)} "
-                 f"({appliances.base_daily_kwh * 365:.0f} kWh{t('per_year', lang)})")
+        # Quick summary below the house figure
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**{t('house_label', lang)}**")
+            st.write(f"- {t('area_label', lang)}: {house.area_m2} m\u00b2 | {t('floors_label', lang)}: {house.floors}")
+            st.write(f"- {t('insulation_label', lang)}: {house.wall_insulation_cm} cm")
+            st.write(f"- {t('heat_loss_label', lang)}: {house.envelope_loss_coefficient:.0f} W/K")
+        with c2:
+            st.markdown(f"**{t('energy_systems', lang)}**")
+            if pv_params.enabled: st.write(f"- PV: {pv_params.total_kwp:.1f} kWp ({azimuth}\u00b0)")
+            if battery.enabled: st.write(f"- {t('battery', lang)}: {battery.capacity_kwh} kWh")
+            if heat_pump.enabled: st.write(f"- {t('heat_pump', lang)}: {heat_pump.rated_power_kw} kW")
+            if recuperator.enabled: st.write(f"- {t('recuperator', lang)}: {recuperator.efficiency*100:.0f}%")
+            st.write(f"- **{t('total', lang)}**: {total_inv:,.0f} {CURRENCY}")
 
 # ══════════════════════════════════════════════════════════════════════════
 # TAB 2: Simulation Results
@@ -645,6 +577,95 @@ with tab_results:
                                 yaxis_title=t("cumulative_cost", lang, currency=CURRENCY),
                                 template="plotly_white", height=400)
             st.plotly_chart(fig_r, use_container_width=True)
+        # ── Savings breakdown ──
+        st.subheader(t("savings_breakdown", lang))
+
+        # Baseline: all consumption from grid at base price (no systems at all)
+        baseline_annual = avg_cons * tariff.price_per_kwh + tariff.fixed_monthly_cost * 12
+
+        # Actual costs with systems
+        actual_annual = result.total_net_cost_mean / sim_p.years
+
+        # Calculate component savings
+        savings_items = []
+
+        # PV savings: self-consumed PV * grid price + exported PV * feed-in
+        if pv_params.enabled:
+            pv_save = avg_self * tariff.price_per_kwh + avg_export * tariff.feed_in_tariff
+            savings_items.append((t("pv_panels", lang), pv_save, pv_params.total_cost))
+
+        # Heat pump savings: heating is done at COP instead of 1:1 electric
+        if heat_pump.enabled:
+            avg_heat_thermal = np.mean([getattr(y, "heating_kwh_thermal") for y in fy])
+            hp_savings = (avg_heat_thermal - avg_heat) * tariff.price_per_kwh  # saved electric kWh
+            savings_items.append((t("heat_pump", lang), hp_savings, heat_pump.cost_total))
+
+        # Battery savings: displaces grid import with stored PV
+        if battery.enabled:
+            # Battery value = energy discharged * (grid_price - feed_in) - losses
+            avg_cycles = np.mean([getattr(y, "battery_cycles") for y in fy])
+            bat_discharge_yr = avg_cycles * battery.usable_kwh
+            bat_value = bat_discharge_yr * (tariff.price_per_kwh - tariff.feed_in_tariff)
+            savings_items.append((t("battery", lang), bat_value, battery.cost_total))
+
+        # Recuperator savings
+        if recuperator.enabled:
+            vent_loss_coeff = house.ventilation_loss_coefficient
+            saved_vent_frac = recuperator.efficiency
+            # Approximate annual thermal savings
+            avg_hdd = max(1, sum(max(0, house.target_temp_winter_c - mt[0])
+                                for mt in [(t_c,) for t_c in np.linspace(-3, 15, 12)] ))
+            recup_thermal_save = vent_loss_coeff * saved_vent_frac * avg_hdd * 24 / 1000.0
+            cop_avg = 3.2 if heat_pump.enabled else 1.0
+            recup_save = recup_thermal_save / cop_avg * tariff.price_per_kwh
+            savings_items.append((t("recuperator", lang), recup_save, recuperator.cost_total))
+
+        if savings_items:
+            sd_names, sd_save, sd_cost = zip(*savings_items)
+            sd_payback = [c / s if s > 0 else float("inf") for c, s in zip(sd_cost, sd_save)]
+
+            # Table
+            savings_df = pd.DataFrame({
+                t("device", lang): sd_names,
+                t("savings_per_year", lang): [f"{s:,.0f} {CURRENCY}" for s in sd_save],
+                t("investment_costs", lang): [f"{c:,.0f} {CURRENCY}" for c in sd_cost],
+                t("payback_years", lang): [f"{p:.1f}" if p < 100 else "-" for p in sd_payback],
+            })
+            st.dataframe(savings_df, use_container_width=True, hide_index=True)
+
+            # Bar chart
+            fig_sv = go.Figure()
+            fig_sv.add_trace(go.Bar(x=list(sd_names), y=list(sd_save),
+                                    name=t("savings_per_year", lang),
+                                    marker_color="#43A047"))
+            fig_sv.add_trace(go.Bar(x=list(sd_names),
+                                    y=[c / 10 for c in sd_cost],
+                                    name=t("investment_cost_10y", lang),
+                                    marker_color="#E53935", opacity=0.6))
+            fig_sv.update_layout(barmode="group", template="plotly_white",
+                                 height=300,
+                                 yaxis_title=f"{CURRENCY}/{t('per_year', lang)}")
+            st.plotly_chart(fig_sv, use_container_width=True)
+
+        # ── Battery details ──
+        if battery.enabled:
+            st.subheader(t("battery_analysis", lang))
+            avg_cycles_val = np.mean([getattr(y, "battery_cycles") for y in fy])
+            bat_discharge_kwh = avg_cycles_val * battery.usable_kwh
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric(t("battery_cycles_year", lang), f"{avg_cycles_val:.0f}")
+            with c2:
+                st.metric(t("battery_throughput", lang), f"{bat_discharge_kwh:,.0f} kWh")
+            with c3:
+                bat_profit = bat_discharge_kwh * (tariff.price_per_kwh - tariff.feed_in_tariff)
+                st.metric(t("battery_profit_year", lang), f"{bat_profit:,.0f} {CURRENCY}")
+            with c4:
+                bat_payback = battery.cost_total / bat_profit if bat_profit > 0 else float("inf")
+                st.metric(t("battery_payback", lang),
+                          f"{bat_payback:.1f} {t('years_unit', lang)}" if bat_payback < 100 else "-")
+
     else:
         st.info(t("click_to_run", lang))
 
